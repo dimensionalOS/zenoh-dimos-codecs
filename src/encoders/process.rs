@@ -85,8 +85,14 @@ fn serve(factory: &(dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync)) -> Result<
     loop {
         // the parent closed the pipe: it is done with this encoder
         let Some((frame, target)) = read_request(&mut input)? else { return Ok(()) };
-        let reply = encoder.encode(&frame, &target).map_err(|error| format!("{error:#}"));
-        write_reply(&mut output, &reply, encoder.last_frame_id())?;
+        let mut reply = encoder.encode(&frame, &target).map(|first| first.map(|frame| (frame, encoder.last_frame_id())).into_iter().collect::<Vec<_>>());
+        if let Ok(frames) = &mut reply {
+            while let Ok(Some(frame)) = encoder.next_output() {
+                frames.push((frame, encoder.last_frame_id()));
+            }
+        }
+        let reply = reply.map_err(|error| format!("{error:#}"));
+        write_reply(&mut output, &reply)?;
         output.flush()?;
         if let Err(error) = reply {
             bail!("encoder failed: {error}");
@@ -102,8 +108,10 @@ pub struct ProcessEncoder {
     child: Option<Running>,
     /// children started for this encoder, the first included
     pub starts: u64,
-    /// the child's encoder's `last_frame_id`, as of its last reply
+    /// the child's encoder's `last_frame_id` for the frame last handed out
     last_frame_id: Option<u64>,
+    /// frames the last reply had beyond its first, for `next_output`
+    more: std::collections::VecDeque<(EncodedVideo, Option<u64>)>,
 }
 
 /// A started child and the thread that talks to it.
@@ -115,8 +123,9 @@ struct Running {
     ready: bool,
 }
 
-/// A child's answer to a frame: one (or none yet), and whose it is if the encoder's output trails its input.
-type Encoded = std::result::Result<Option<(EncodedVideo, Option<u64>)>, String>;
+/// A child's answer to a frame: every frame that came out (none yet, or several from a pipeline catching up), each with
+/// whose it is if the encoder's output trails its input.
+type Encoded = std::result::Result<Vec<(EncodedVideo, Option<u64>)>, String>;
 
 enum Reply {
     Ready,
@@ -126,7 +135,7 @@ enum Reply {
 impl ProcessEncoder {
     /// Encodes `format` in children run as `config` says; the first is started now, so it is ready by the first frames.
     pub fn new(config: ProcessConfig, format: VideoFormat) -> Self {
-        let mut encoder = ProcessEncoder { config, format, child: None, starts: 0, last_frame_id: None };
+        let mut encoder = ProcessEncoder { config, format, child: None, starts: 0, last_frame_id: None, more: Default::default() };
         if let Err(error) = encoder.start() {
             log::warn!("{error:#}");
         }
@@ -151,6 +160,13 @@ impl ProcessEncoder {
 
     /// Whether the child has said it is ready, without waiting: one that failed, exited or took too long to start is
     /// restarted.
+    /// The oldest frame the child sent that isn't handed out yet, its frame id kept for `last_frame_id`.
+    fn next_output_now(&mut self) -> Option<EncodedVideo> {
+        let (frame, frame_id) = self.more.pop_front()?;
+        self.last_frame_id = frame_id;
+        Some(frame)
+    }
+
     fn ready(&mut self) -> bool {
         let running = self.child.as_mut().expect("started");
         if running.ready {
@@ -217,6 +233,10 @@ impl VideoEncoder for ProcessEncoder {
         self.last_frame_id
     }
 
+    fn next_output(&mut self) -> Result<Option<EncodedVideo>> {
+        Ok(self.next_output_now())
+    }
+
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
         self.last_frame_id = None;
         if self.child.is_none() {
@@ -233,9 +253,9 @@ impl VideoEncoder for ProcessEncoder {
             bail!("the video encoder process exited: restarted");
         }
         match running.replies.recv_timeout(self.config.deadline) {
-            Ok(Ok(Reply::Encoded(Ok(encoded)))) => {
-                self.last_frame_id = encoded.as_ref().and_then(|(_, frame_id)| *frame_id);
-                Ok(encoded.map(|(frame, _)| frame))
+            Ok(Ok(Reply::Encoded(Ok(frames)))) => {
+                self.more.extend(frames);
+                Ok(self.next_output_now())
             }
             Ok(Ok(Reply::Encoded(Err(error)))) => {
                 self.restart(&format!("failed ({error})"));
@@ -360,21 +380,21 @@ fn read_request(input: &mut impl Read) -> Result<Option<(DecodedFrame, VideoTarg
     Ok(Some((DecodedFrame::Video(image), target)))
 }
 
-/// 0 = nothing out yet; 1 = a frame (width u32, height u32, keyframe u8, length u32, bytes), 3 = one from an earlier
-/// input (the same, with its frame id u64 after keyframe); 2 = an error (length u32, UTF-8), little endian.
-fn write_reply(output: &mut impl Write, reply: &std::result::Result<Option<EncodedVideo>, String>, frame_id: Option<u64>) -> Result<()> {
+/// 1 = frames (count u32, then each: width u32, height u32, keyframe u8, has a frame id u8, frame id u64, length u32,
+/// bytes); 2 = an error (length u32, UTF-8), little endian.
+fn write_reply(output: &mut impl Write, reply: &Encoded) -> Result<()> {
     match reply {
-        Ok(None) => output.write_all(&[0])?,
-        Ok(Some(frame)) => {
-            output.write_all(&[if frame_id.is_some() { 3 } else { 1 }])?;
-            output.write_all(&frame.width.to_le_bytes())?;
-            output.write_all(&frame.height.to_le_bytes())?;
-            output.write_all(&[frame.keyframe as u8])?;
-            if let Some(frame_id) = frame_id {
-                output.write_all(&frame_id.to_le_bytes())?;
+        Ok(frames) => {
+            output.write_all(&[1])?;
+            output.write_all(&(frames.len() as u32).to_le_bytes())?;
+            for (frame, frame_id) in frames {
+                output.write_all(&frame.width.to_le_bytes())?;
+                output.write_all(&frame.height.to_le_bytes())?;
+                output.write_all(&[frame.keyframe as u8, frame_id.is_some() as u8])?;
+                output.write_all(&frame_id.unwrap_or(0).to_le_bytes())?;
+                output.write_all(&(frame.data.len() as u32).to_le_bytes())?;
+                output.write_all(&frame.data)?;
             }
-            output.write_all(&(frame.data.len() as u32).to_le_bytes())?;
-            output.write_all(&frame.data)?;
         }
         Err(error) => {
             output.write_all(&[2])?;
@@ -388,14 +408,18 @@ fn write_reply(output: &mut impl Write, reply: &std::result::Result<Option<Encod
 fn read_reply(input: &mut impl Read) -> Result<Encoded> {
     let [tag] = read_array(input)?;
     Ok(match tag {
-        0 => Ok(None),
-        1 | 3 => {
-            let (width, height) = (read_u32(input)?, read_u32(input)?);
-            let [keyframe] = read_array(input)?;
-            let frame_id = if tag == 3 { Some(u64::from_le_bytes(read_array(input)?)) } else { None };
-            let mut data = vec![0u8; read_u32(input)? as usize];
-            input.read_exact(&mut data)?;
-            Ok(Some((EncodedVideo { data, width, height, keyframe: keyframe != 0 }, frame_id)))
+        1 => {
+            let count = read_u32(input)?;
+            let mut frames = Vec::new();
+            for _ in 0..count {
+                let (width, height) = (read_u32(input)?, read_u32(input)?);
+                let [keyframe, has_frame_id] = read_array(input)?;
+                let frame_id = u64::from_le_bytes(read_array(input)?);
+                let mut data = vec![0u8; read_u32(input)? as usize];
+                input.read_exact(&mut data)?;
+                frames.push((EncodedVideo { data, width, height, keyframe: keyframe != 0 }, (has_frame_id != 0).then_some(frame_id)));
+            }
+            Ok(frames)
         }
         2 => {
             let mut text = vec![0u8; read_u32(input)? as usize];
@@ -454,15 +478,13 @@ mod tests {
         assert!(read_request(&mut unknown_format.as_slice()).is_err(), "an unknown pixel format");
 
         let frame = EncodedVideo { data: vec![0, 0, 0, 1, 0x65], width: 4, height: 2, keyframe: true };
-        for reply in [Ok(None), Ok(Some(frame)), Err("the device went away".to_owned())] {
-            for frame_id in [None, Some(41)] {
-                let mut bytes = Vec::new();
-                write_reply(&mut bytes, &reply, frame_id).unwrap();
-                let read = read_reply(&mut bytes.as_slice()).unwrap();
-                assert_eq!(read, reply.clone().map(|frame| frame.map(|frame| (frame, frame_id))));
-            }
+        let later = EncodedVideo { data: vec![0, 0, 0, 1, 0x41], width: 4, height: 2, keyframe: false };
+        for reply in [Ok(vec![]), Ok(vec![(frame.clone(), None)]), Ok(vec![(frame, Some(41)), (later, Some(42))]), Err("the device went away".to_owned())] {
+            let mut bytes = Vec::new();
+            write_reply(&mut bytes, &reply).unwrap();
+            assert_eq!(read_reply(&mut bytes.as_slice()).unwrap(), reply);
         }
         assert!(read_reply(&mut &[7u8][..]).is_err(), "an unknown reply tag");
-        assert!(read_reply(&mut &[1u8, 4, 0][..]).is_err(), "a truncated frame");
+        assert!(read_reply(&mut &[1u8, 1, 0, 0, 0, 4, 0][..]).is_err(), "a truncated frame");
     }
 }

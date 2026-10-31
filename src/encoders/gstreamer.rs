@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
@@ -296,8 +297,8 @@ struct Pipeline {
     jpeg: Option<(u32, u32)>,
     fps: f64,
     bitrate_bps: u32,
-    pushed: u64,
-    pulled: u64,
+    /// the frame ids inside, oldest first: access units come out in order, one per frame
+    inside: VecDeque<u64>,
 }
 
 // SAFETY: GStreamer objects are thread-safe; the encoder uses them one call at a time (`&mut self`)
@@ -344,7 +345,7 @@ impl Pipeline {
                 bail!("GStreamer pipeline {description:?}: {message}");
             }
             let by_name = |name: &str| (api.bin_get_by_name)(pipeline, c_string(name).as_ptr());
-            let mut pipeline = Pipeline { api, pipeline, source: by_name("source"), sink: by_name("sink"), encoder: by_name("encoder"), element, size: (width, height), jpeg, fps, bitrate_bps: 0, pushed: 0, pulled: 0 };
+            let mut pipeline = Pipeline { api, pipeline, source: by_name("source"), sink: by_name("sink"), encoder: by_name("encoder"), element, size: (width, height), jpeg, fps, bitrate_bps: 0, inside: VecDeque::new() };
             ensure!(!pipeline.source.is_null() && !pipeline.sink.is_null() && !pipeline.encoder.is_null(), "GStreamer pipeline lost its elements");
             for (name, value) in element.settings {
                 pipeline.set(name, value);
@@ -385,7 +386,8 @@ impl Pipeline {
 
     /// Pushes one picture (I420 in GStreamer's layout, or a JPEG) and takes the oldest access unit out: at once if one is
     /// ready, waiting only once `MAX_IN_FLIGHT` frames are inside (every access unit comes out, in order, one per call).
-    fn encode(&mut self, buffer: &[u8], keyframe: bool) -> Result<Option<Vec<u8>>> {
+    /// Returns it with its frame id.
+    fn encode(&mut self, buffer: &[u8], keyframe: bool, frame_id: u64) -> Result<Option<(Vec<u8>, u64)>> {
         // SAFETY: the event is handed over to appsrc
         unsafe {
             if keyframe {
@@ -396,13 +398,12 @@ impl Pipeline {
             }
         }
         push(self.api, self.source, buffer)?;
-        self.pushed += 1;
+        self.inside.push_back(frame_id);
         let in_flight = if self.jpeg.is_some() { jpeg_in_flight() } else { MAX_IN_FLIGHT };
-        let timeout = if self.pushed - self.pulled > in_flight { OUTPUT_TIMEOUT } else { Duration::ZERO };
+        let timeout = if self.inside.len() as u64 > in_flight { OUTPUT_TIMEOUT } else { Duration::ZERO };
         let data = pull(self.api, self.sink, timeout)?;
         self.check_bus()?;
-        self.pulled += data.is_some() as u64;
-        Ok(data)
+        Ok(data.map(|data| (data, self.inside.pop_front().unwrap_or(frame_id))))
     }
 }
 
@@ -435,6 +436,8 @@ pub struct GstreamerEncoder {
     api: &'static Api,
     element: &'static Element,
     pipeline: Option<Pipeline>,
+    /// the frame id of the access unit `encode` last returned
+    last_frame_id: Option<u64>,
 }
 
 impl GstreamerEncoder {
@@ -448,7 +451,7 @@ impl GstreamerEncoder {
             ensure!(!factory.is_null(), "GStreamer has no {name}");
             (api.object_unref)(factory);
         }
-        Ok(GstreamerEncoder { api, element, pipeline: None })
+        Ok(GstreamerEncoder { api, element, pipeline: None, last_frame_id: None })
     }
 
     /// The first hardware encoder that is installed and encodes a test frame.
@@ -484,6 +487,10 @@ impl VideoEncoder for GstreamerEncoder {
         VideoFormat::H264
     }
 
+    fn last_frame_id(&self) -> Option<u64> {
+        self.last_frame_id
+    }
+
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
         let DecodedFrame::Video(image) = frame else { bail!("{} takes pictures, got {frame:?}", self.element.name) };
         let size = at_least((target.width, target.height), self.element.min_size);
@@ -499,9 +506,11 @@ impl VideoEncoder for GstreamerEncoder {
             pipeline.set_bitrate(target.bitrate_bps);
         }
         let encoded = match jpeg {
-            Some((bytes, _)) => pipeline.encode(bytes, target.keyframe && !fresh)?,
-            None => pipeline.encode(&gstreamer_layout(image.to_i420(size.0, size.1)?.data(), size), target.keyframe && !fresh)?,
+            Some((bytes, _)) => pipeline.encode(bytes, target.keyframe && !fresh, target.frame_id)?,
+            None => pipeline.encode(&gstreamer_layout(image.to_i420(size.0, size.1)?.data(), size), target.keyframe && !fresh, target.frame_id)?,
         };
+        self.last_frame_id = encoded.as_ref().map(|(_, frame_id)| *frame_id);
+        let encoded = encoded.map(|(data, _)| data);
         Ok(encoded.map(|data| EncodedVideo { keyframe: has_idr(&data), data, width: size.0, height: size.1 }))
     }
 }

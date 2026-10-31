@@ -187,6 +187,10 @@ impl<E: VideoEncoder> VideoEncoder for Fallback<E> {
         // a new software encoder starts with a keyframe
         self.software.encode(frame, target)
     }
+
+    fn last_frame_id(&self) -> Option<u64> {
+        self.hardware.as_ref().and_then(|hardware| hardware.last_frame_id())
+    }
 }
 
 #[cfg(test)]

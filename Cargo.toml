@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-dimos-codecs"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 rust-version = "1.88"
 description = "zenoh-gateway codecs for ROS 2 and dimos images, depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
@@ -22,7 +22,7 @@ gstreamer = ["dep:libloading"]
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
-zenoh-gateway = "0.5.36"
+zenoh-gateway = "0.5.37"
 anyhow = "1"
 # encodeOptions
 serde_json = "1"
@@ -41,6 +41,11 @@ libloading = { version = "0.9", optional = true }
 [dev-dependencies]
 # decodes what the hardware encoders produce
 openh264 = "0.9"
+
+# (it drives the Jetson's encoder: `cargo test` elsewhere skips it instead of failing to build)
+[[example]]
+name = "transcode_bench"
+required-features = ["gstreamer"]
 
 [patch.crates-io]
 # zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor

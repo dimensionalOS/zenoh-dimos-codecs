@@ -406,12 +406,12 @@ impl Pipeline {
         Ok(data.map(|data| (data, self.inside.pop_front().unwrap_or(frame_id))))
     }
 
-    /// An access unit that came out since, without pushing, and its frame id.
-    fn next(&mut self) -> Result<Option<(Vec<u8>, u64)>> {
+    /// An access unit that came out since, without pushing, waiting at most `wait` for one, and its frame id.
+    fn next(&mut self, wait: Duration) -> Result<Option<(Vec<u8>, u64)>> {
         if self.inside.is_empty() {
             return Ok(None);
         }
-        let data = pull(self.api, self.sink, Duration::ZERO)?;
+        let data = pull(self.api, self.sink, wait)?;
         Ok(data.and_then(|data| Some((data, self.inside.pop_front()?))))
     }
 }
@@ -500,9 +500,9 @@ impl VideoEncoder for GstreamerEncoder {
         self.last_frame_id
     }
 
-    fn next_output(&mut self) -> Result<Option<EncodedVideo>> {
+    fn next_output(&mut self, wait: Duration) -> Result<Option<EncodedVideo>> {
         let Some(pipeline) = self.pipeline.as_mut() else { return Ok(None) };
-        let Some((data, frame_id)) = pipeline.next()? else { return Ok(None) };
+        let Some((data, frame_id)) = pipeline.next(wait)? else { return Ok(None) };
         self.last_frame_id = Some(frame_id);
         Ok(Some(EncodedVideo { keyframe: has_idr(&data), data, width: pipeline.size.0, height: pipeline.size.1 }))
     }

@@ -84,11 +84,17 @@ fn serve(factory: &(dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync)) -> Result<
     output.flush()?;
     loop {
         // the parent closed the pipe: it is done with this encoder
-        let Some((frame, target)) = read_request(&mut input)? else { return Ok(()) };
-        let mut reply = encoder.encode(&frame, &target).map(|first| first.map(|frame| (frame, encoder.last_frame_id())).into_iter().collect::<Vec<_>>());
+        let Some(request) = read_request(&mut input)? else { return Ok(()) };
+        // an encode's own frame (or an earlier one's), then any others out already; or, asked for, the next to come out
+        let (mut reply, wait) = match request {
+            Request::Encode(frame, target) => (encoder.encode(&frame, &target).map(|first| first.map(|frame| (frame, encoder.last_frame_id())).into_iter().collect::<Vec<_>>()), Duration::ZERO),
+            Request::Next(wait) => (Ok(Vec::new()), wait),
+        };
         if let Ok(frames) = &mut reply {
-            while let Ok(Some(frame)) = encoder.next_output() {
+            let mut wait = wait;
+            while let Ok(Some(frame)) = encoder.next_output(wait) {
                 frames.push((frame, encoder.last_frame_id()));
+                wait = Duration::ZERO;
             }
         }
         let reply = reply.map_err(|error| format!("{error:#}"));
@@ -233,8 +239,13 @@ impl VideoEncoder for ProcessEncoder {
         self.last_frame_id
     }
 
-    fn next_output(&mut self) -> Result<Option<EncodedVideo>> {
-        Ok(self.next_output_now())
+    fn next_output(&mut self, wait: Duration) -> Result<Option<EncodedVideo>> {
+        if !self.more.is_empty() || wait.is_zero() || !self.child.as_ref().is_some_and(|running| running.ready) {
+            return Ok(self.next_output_now());
+        }
+        // the child waits for its encoder, so a frame finishing between inputs goes out when it comes out
+        self.last_frame_id = None;
+        self.exchange(next_request(wait))
     }
 
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
@@ -246,8 +257,14 @@ impl VideoEncoder for ProcessEncoder {
             return Ok(None);
         }
         // a fresh child's first frame is a keyframe, which the viewers need after a restart
-        let request = encode_request(frame, target)?;
-        let running = self.child.as_mut().expect("started above");
+        self.exchange(encode_request(frame, target)?)
+    }
+}
+
+impl ProcessEncoder {
+    /// Sends the started, ready child `request` and hands out the first frame of its answer (the rest wait in `more`).
+    fn exchange(&mut self, request: Vec<u8>) -> Result<Option<EncodedVideo>> {
+        let running = self.child.as_mut().expect("started");
         if running.requests.send(request).is_err() {
             self.restart("exited");
             bail!("the video encoder process exited: restarted");
@@ -313,10 +330,26 @@ fn talk(stdin: ChildStdin, stdout: ChildStdout, requests: mpsc::Receiver<Vec<u8>
 }
 
 /// A request's bytes before the picture's: the layout [`encode_request`] documents.
-const REQUEST_HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 8 + 1 + 8 + 1 + 4 + 4 + 4;
+const REQUEST_HEADER_BYTES: usize = 1 + 8 + 4 + 4 + 4 + 8 + 1 + 8 + 1 + 4 + 4 + 4;
+/// A request's first byte: an encode, or a wait for the next frame out.
+const ENCODE: u8 = 0;
+const NEXT: u8 = 1;
 
-/// `target` (quality f64, width u32, height u32, bitrate u32, fps f64, keyframe u8), then the picture (pixel format
-/// u8, width u32, height u32, length u32, bytes), little endian.
+/// [`NEXT`], then how long the child may wait (ns u64), little endian.
+fn next_request(wait: Duration) -> Vec<u8> {
+    let mut bytes = vec![NEXT];
+    bytes.extend_from_slice(&(wait.as_nanos() as u64).to_le_bytes());
+    bytes
+}
+
+/// What the parent asks a child: encode a picture, or the next frame its encoder lets out, waiting up to a time.
+enum Request {
+    Encode(DecodedFrame, VideoTarget),
+    Next(Duration),
+}
+
+/// [`ENCODE`], then `target` (quality f64, width u32, height u32, bitrate u32, fps f64, keyframe u8, frame id u64), then
+/// the picture (pixel format u8, width u32, height u32, length u32, bytes), little endian.
 fn encode_request(frame: &DecodedFrame, target: &VideoTarget) -> Result<Vec<u8>> {
     let DecodedFrame::Video(image) = frame else { bail!("a video encoder process encodes pictures, got {frame:?}") };
     // scaled here, the pipe carries the picture at the size it is encoded at: the R1's full-size 1920x1536 RGB (8.8 MB)
@@ -338,6 +371,7 @@ fn encode_request(frame: &DecodedFrame, target: &VideoTarget) -> Result<Vec<u8>>
         }, image.data()),
     };
     let mut bytes = Vec::with_capacity(REQUEST_HEADER_BYTES + data.len());
+    bytes.push(ENCODE);
     bytes.extend_from_slice(&target.quality.to_le_bytes());
     bytes.extend_from_slice(&target.width.to_le_bytes());
     bytes.extend_from_slice(&target.height.to_le_bytes());
@@ -353,14 +387,19 @@ fn encode_request(frame: &DecodedFrame, target: &VideoTarget) -> Result<Vec<u8>>
     Ok(bytes)
 }
 
-fn read_request(input: &mut impl Read) -> Result<Option<(DecodedFrame, VideoTarget)>> {
-    let mut head = [0u8; 8];
-    match input.read_exact(&mut head) {
+fn read_request(input: &mut impl Read) -> Result<Option<Request>> {
+    let mut kind = [0u8; 1];
+    match input.read_exact(&mut kind) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error.into()),
     }
-    let quality = f64::from_le_bytes(head);
+    match kind[0] {
+        ENCODE => {}
+        NEXT => return Ok(Some(Request::Next(Duration::from_nanos(u64::from_le_bytes(read_array(input)?))))),
+        other => bail!("unknown request {other}"),
+    }
+    let quality = f64::from_le_bytes(read_array(input)?);
     let (width, height, bitrate_bps) = (read_u32(input)?, read_u32(input)?, read_u32(input)?);
     let fps = f64::from_le_bytes(read_array(input)?);
     let [keyframe] = read_array(input)?;
@@ -377,7 +416,7 @@ fn read_request(input: &mut impl Read) -> Result<Option<(DecodedFrame, VideoTarg
     };
     let mut target = VideoTarget::new(width, height, bitrate_bps, fps);
     (target.quality, target.keyframe, target.frame_id) = (quality, keyframe != 0, frame_id);
-    Ok(Some((DecodedFrame::Video(image), target)))
+    Ok(Some(Request::Encode(DecodedFrame::Video(image), target)))
 }
 
 /// 1 = frames (count u32, then each: width u32, height u32, keyframe u8, has a frame id u8, frame id u64, length u32,
@@ -451,13 +490,16 @@ mod tests {
         (target.quality, target.keyframe, target.frame_id) = (0.25, true, 7);
         let request = encode_request(&DecodedFrame::Video(image), &target).unwrap();
         assert_eq!(request.len(), REQUEST_HEADER_BYTES + 12);
-        let (DecodedFrame::Video(decoded), decoded_target) = read_request(&mut request.as_slice()).unwrap().unwrap() else { panic!("a picture") };
+        let Request::Encode(DecodedFrame::Video(decoded), decoded_target) = read_request(&mut request.as_slice()).unwrap().unwrap() else { panic!("a picture") };
         assert_eq!((decoded.width(), decoded.height(), decoded.format(), decoded.data()), (4, 2, PixelFormat::I420, &(0..12).collect::<Vec<u8>>()[..]));
         assert_eq!((decoded_target.quality, decoded_target.bitrate_bps, decoded_target.fps, decoded_target.keyframe, decoded_target.frame_id), (0.25, 300_000, 15.0, true, 7));
         assert!(read_request(&mut &[][..]).unwrap().is_none(), "a closed pipe is the end, not an error");
+        let Request::Next(wait) = read_request(&mut next_request(Duration::from_millis(33)).as_slice()).unwrap().unwrap() else { panic!("a wait") };
+        assert_eq!(wait, Duration::from_millis(33));
+        assert!(read_request(&mut &[9u8][..]).is_err(), "an unknown request");
         // a picture bigger than the target goes over at the target's size
         let big = VideoImage::rgb8(8, 4, vec![200; 8 * 4 * 3]).unwrap();
-        let (DecodedFrame::Video(sent), _) = read_request(&mut encode_request(&DecodedFrame::Video(big), &target).unwrap().as_slice()).unwrap().unwrap() else { panic!("a picture") };
+        let Request::Encode(DecodedFrame::Video(sent), _) = read_request(&mut encode_request(&DecodedFrame::Video(big), &target).unwrap().as_slice()).unwrap().unwrap() else { panic!("a picture") };
         assert_eq!((sent.width(), sent.height(), sent.format()), (4, 2, PixelFormat::I420));
         // a JPEG goes as it is, at its own size, and the child can still decode it
         let jpeg = crate::utils::tests::fixture("compressed/pattern.jpeg");
@@ -468,13 +510,13 @@ mod tests {
             crate::utils::compressed_image::decode_jpeg(bytes)
         };
         let still_jpeg = VideoImage::jpeg(size.0, size.1, jpeg.clone(), counted).unwrap();
-        let (DecodedFrame::Video(sent), _) = read_request(&mut encode_request(&DecodedFrame::Video(still_jpeg), &target).unwrap().as_slice()).unwrap().unwrap() else { panic!("a picture") };
+        let Request::Encode(DecodedFrame::Video(sent), _) = read_request(&mut encode_request(&DecodedFrame::Video(still_jpeg), &target).unwrap().as_slice()).unwrap().unwrap() else { panic!("a picture") };
         assert_eq!((sent.jpeg_bytes(), sent.width(), sent.height()), (Some(&jpeg[..]), size.0, size.1));
         assert!(!DECODED.load(std::sync::atomic::Ordering::SeqCst), "sending a JPEG never decodes it (it cost 30 ms a frame on the R1)");
         assert!(!sent.data().is_empty());
         assert!(read_request(&mut &request[..request.len() - 1]).is_err(), "a truncated picture");
         let mut unknown_format = request.clone();
-        unknown_format[37] = 9;
+        unknown_format[38] = 9;
         assert!(read_request(&mut unknown_format.as_slice()).is_err(), "an unknown pixel format");
 
         let frame = EncodedVideo { data: vec![0, 0, 0, 1, 0x65], width: 4, height: 2, keyframe: true };

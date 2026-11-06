@@ -3,7 +3,7 @@ name = "zenoh-dimos-codecs"
 version = "0.3.12"
 edition = "2024"
 rust-version = "1.88"
-description = "zenoh-gateway codecs for ROS 2 and dimos images, depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
+description = "zenoh-gateway codecs for ROS 2 and dimos images, compressed video (H.264, H.265), depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
 repository = "https://github.com/jeff-hykin/zenoh-dimos-codecs"
 license-file = "LICENSE"
 readme = "README.md"
@@ -16,7 +16,7 @@ default = []
 videotoolbox = []
 # encoders: GStreamer's hardware H.264 encoders, loaded at runtime (dlopen, so building needs no GStreamer): nvv4l2h264enc
 # (Jetson), nvh264enc (NVENC), vah264enc / vaapih264enc (VAAPI)
-gstreamer = ["dep:libloading"]
+gstreamer = []
 # JPEG decoding with libjpeg-turbo (vendored C, built by cmake and linked statically; x86 needs nasm too) instead of
 # zune-jpeg: the video path gets the JPEG's own YCbCr planes, with no chroma upsampling to undo
 turbojpeg = ["dep:turbojpeg"]
@@ -36,10 +36,9 @@ jxl-oxide = "0.12"
 jpeg-encoder = "0.7"
 # encoders
 log = "0.4"
-libloading = { version = "0.9", optional = true }
-
-[dev-dependencies]
-# decodes what the hardware encoders produce
+# GStreamer (feature gstreamer) and libde265 (H.265 compressed video), loaded at runtime
+libloading = "0.9"
+# H.264 compressed video (the C sources zenoh-gateway's encoder builds anyway)
 openh264 = "0.9"
 
 # (it drives the Jetson's encoder: `cargo test` elsewhere skips it instead of failing to build)

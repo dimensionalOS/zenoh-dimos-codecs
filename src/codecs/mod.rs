@@ -11,12 +11,14 @@ pub fn all() -> Vec<Arc<dyn MessageEncoding>> {
     vec![
         Arc::new(Ros2Image),
         Arc::new(Ros2CompressedImage),
+        Arc::new(Ros2CompressedVideo),
         Arc::new(Ros2Depth),
         Arc::new(Ros2CompressedDepth),
         Arc::new(Ros2PointCloud2),
         Arc::new(Ros2RawAudio),
         Arc::new(DimosLcmImage),
         Arc::new(DimosLcmCompressedImage),
+        Arc::new(DimosLcmCompressedVideo),
         Arc::new(DimosLcmDepth),
         Arc::new(DimosLcmCompressedDepth),
         Arc::new(DimosLcmPointCloud2),
@@ -41,7 +43,7 @@ mod tests {
     #[test]
     fn outputs_and_round_trips() {
         let names: Vec<_> = all().iter().map(|codec| (codec.name().to_owned(), codec.output())).collect();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 14);
         assert!(names.contains(&("ros2_image".to_owned(), EncodingOutput::Video)));
         assert!(names.contains(&("dimos_lcm_depth".to_owned(), EncodingOutput::Fields)));
         assert!(names.contains(&("ros2_raw_audio".to_owned(), EncodingOutput::Audio)));
@@ -69,6 +71,7 @@ mod tests {
         let cases = [
             ("dimos_lcm_image", "dimos/image_rgb8.bin"), ("dimos_lcm_compressed_image", "dimos/compressed_png.bin"), ("dimos_lcm_depth", "dimos/depth_16UC1.bin"),
             ("dimos_lcm_compressed_depth", "dimos/compressed_jxl_depth16.bin"), ("dimos_lcm_pointcloud2", "dimos/pointcloud_xyzi.bin"),
+            ("dimos_lcm_compressed_video", "dimos/compressed_video_h265.bin"), ("ros2_compressed_video", "ros2/compressed_video_h265.cdr"),
             ("ros2_image", "ros2/image_rgb8.cdr"), ("ros2_compressed_image", "ros2/compressed_png.cdr"), ("ros2_depth", "ros2/depth_16UC1.cdr"),
             ("ros2_compressed_depth", "ros2/compressed_jxl_depth16.cdr"), ("ros2_pointcloud2", "ros2/pointcloud_xyz.cdr"),
         ];
@@ -77,7 +80,7 @@ mod tests {
             let (payload, encoding) = (fixture(file), zenoh_gateway::zenoh::bytes::Encoding::default());
             let header = codec.header(&EncodingSample::new("k", &payload, &encoding)).unwrap_or_else(|| panic!("{name}: no header"));
             // (the fixtures' stamp, which an f64 of seconds can't hold exactly once nanoseconds aren't round)
-            assert_eq!((header.sec, header.nanosec, header.seq.is_some()), (1_700_000_000, 500_000_000, name.starts_with("dimos")), "{name}");
+            assert_eq!((header.sec, header.nanosec, header.seq.is_some()), (1_700_000_000, 500_000_000, name.starts_with("dimos") && !name.ends_with("video")), "{name}");
             assert!(!header.frame_id.is_empty(), "{name}: frame id");
         }
         let garbage = zenoh_gateway::zenoh::bytes::Encoding::default();

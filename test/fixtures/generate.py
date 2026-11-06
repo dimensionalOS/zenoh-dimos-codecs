@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate every fixture: dimos message-format payloads (dimos venv), then ROS 2 CDR payloads (rosbags env), then manifest.json.
+"""Regenerate every fixture: dimos message-format payloads (dimos venv), then ROS 2 CDR payloads (rosbags env), then CompressedVideo (dimos venv + ffmpeg), then manifest.json.
 
 Usage: python3 generate.py [--dimos-python PATH] [--ros-python PATH]
   --dimos-python  default ~/repos/dimos/.venv/bin/python
@@ -27,9 +27,11 @@ for sub in ("dimos", "ros2", "compressed"):
 subprocess.run([args.dimos_python, str(HERE / "gen_dimos.py")], check=True)
 ros_cmd = [args.ros_python] if args.ros_python else ["uv", "run", "--no-project", "--python", "3.12", *sum((["--with", d] for d in ROS_DEPS), []), "python"]
 subprocess.run([*ros_cmd, str(HERE / "gen_ros2.py")], check=True)
+subprocess.run([args.dimos_python, str(HERE / "gen_video.py")], check=True)
 
 dimos_entries = json.loads((HERE / "manifest.dimos.json").read_text())
 ros = json.loads((HERE / "manifest.ros2.json").read_text())
+video_entries = json.loads((HERE / "manifest.video.json").read_text())
 manifest = {
     "description": "zenoh-web codec fixtures: one payload file per zenoh sample (the sample's raw payload bytes)",
     "pattern": {
@@ -47,9 +49,10 @@ manifest = {
     },
     "rihs01_jazzy": ros["rihs01"],
     "rihs01_source": "computed by rosbags Typestore(ROS2_JAZZY).hash_rihs01 (std_msgs/String matches the known Jazzy hash df668c74...)",
-    "entries": dimos_entries + ros["entries"],
+    "entries": dimos_entries + ros["entries"] + video_entries,
 }
 (HERE / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 (HERE / "manifest.dimos.json").unlink()
 (HERE / "manifest.ros2.json").unlink()
+(HERE / "manifest.video.json").unlink()
 print(f"manifest.json: {len(manifest['entries'])} entries")

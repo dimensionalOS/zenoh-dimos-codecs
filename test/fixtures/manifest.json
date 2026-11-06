@@ -1673,6 +1673,82 @@
           0.75
         ]
       }
+    },
+    {
+      "file": "dimos/compressed_video_h264.bin",
+      "protocol": "dimos",
+      "bytes": 868,
+      "format": "h264",
+      "msg_type": "foxglove_msgs.CompressedVideo",
+      "zenoh_key": "dimos/camera/color/video/foxglove_msgs.CompressedVideo",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "ffmpeg libx264, one keyframe with its parameter sets",
+      "compressed_bytes_file": "compressed/pattern.h264",
+      "expected": {
+        "lossless": false,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        }
+      }
+    },
+    {
+      "file": "dimos/compressed_video_h265.bin",
+      "protocol": "dimos",
+      "bytes": 2594,
+      "format": "h265",
+      "msg_type": "foxglove_msgs.CompressedVideo",
+      "zenoh_key": "dimos/camera/color/video/foxglove_msgs.CompressedVideo",
+      "frame_id": "camera_color_optical_frame",
+      "width": 320,
+      "height": 240,
+      "encoder": "ffmpeg libx265, one keyframe with its parameter sets",
+      "compressed_bytes_file": "compressed/pattern.h265",
+      "expected": {
+        "lossless": false,
+        "nominal_quadrant_rgb": {
+          "top_left": [
+            255,
+            0,
+            0
+          ],
+          "top_right": [
+            0,
+            255,
+            0
+          ],
+          "bottom_left": [
+            0,
+            0,
+            255
+          ],
+          "bottom_right": [
+            255,
+            255,
+            255
+          ]
+        }
+      }
     }
   ]
 }

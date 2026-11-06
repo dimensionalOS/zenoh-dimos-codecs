@@ -3,12 +3,14 @@
 
 pub mod dimos_lcm_compressed_depth;
 pub mod dimos_lcm_compressed_image;
+pub mod dimos_lcm_compressed_video;
 pub mod dimos_lcm_depth;
 pub mod dimos_lcm_image;
 pub mod dimos_lcm_pointcloud2;
 pub mod dimos_lcm_raw_audio;
 pub mod ros2_compressed_depth;
 pub mod ros2_compressed_image;
+pub mod ros2_compressed_video;
 pub mod ros2_depth;
 pub mod ros2_image;
 pub mod ros2_pointcloud2;
@@ -16,12 +18,14 @@ pub mod ros2_raw_audio;
 
 pub use dimos_lcm_compressed_depth::DimosLcmCompressedDepth;
 pub use dimos_lcm_compressed_image::DimosLcmCompressedImage;
+pub use dimos_lcm_compressed_video::DimosLcmCompressedVideo;
 pub use dimos_lcm_depth::DimosLcmDepth;
 pub use dimos_lcm_image::DimosLcmImage;
 pub use dimos_lcm_pointcloud2::DimosLcmPointCloud2;
 pub use dimos_lcm_raw_audio::DimosLcmRawAudio;
 pub use ros2_compressed_depth::Ros2CompressedDepth;
 pub use ros2_compressed_image::Ros2CompressedImage;
+pub use ros2_compressed_video::Ros2CompressedVideo;
 pub use ros2_depth::Ros2Depth;
 pub use ros2_image::Ros2Image;
 pub use ros2_pointcloud2::Ros2PointCloud2;
@@ -87,6 +91,17 @@ pub struct CompressedImage<'a> {
     pub header: Header,
     pub format: String,
     pub data: &'a [u8],
+}
+
+/// `foxglove_msgs/CompressedVideo`
+#[derive(Debug)]
+pub struct CompressedVideo<'a> {
+    /// its `timestamp` and `frame_id` (no seq)
+    pub header: Header,
+    /// one access unit, Annex-B
+    pub data: &'a [u8],
+    /// `h264`, `h265`, ...
+    pub format: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

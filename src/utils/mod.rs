@@ -3,7 +3,10 @@
 
 pub mod cdr;
 pub mod compressed_image;
+pub mod compressed_video;
 pub mod depth;
+pub mod h264;
+pub mod h265;
 pub mod jpeg;
 pub mod jxl;
 pub mod lcm;

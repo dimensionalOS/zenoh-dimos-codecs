@@ -16,6 +16,8 @@
 //! One codec per message type, in [`codecs::msgs`] (e.g. [`codecs::msgs::Ros2CompressedImage`]); the input type
 //! decides the output:
 //! - `*_image`, `*_compressed_image`: color/mono images, H.264 on a WebRTC video track
+//! - `*_compressed_video`: H.264 or H.265 keyframes (foxglove `CompressedVideo`, each with its parameter sets), decoded
+//!   (H.265 through libde265, loaded at runtime) and re-encoded like any picture, so every browser can play them
 //! - `*_depth`, `*_compressed_depth`: lossless depth (u16/f32) as zenoh-gateway fields
 //! - `*_pointcloud2`: thinned (every Nth point) + int16 quantized points as zenoh-gateway fields
 //! - `*_raw_audio`: `pcm-s16` audio blocks, Opus on a WebRTC audio track

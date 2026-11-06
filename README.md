@@ -19,7 +19,7 @@ for codec in zenoh_dimos_codecs::all() {
 ```
 
 ```js
-import { connect } from "https://esm.sh/gh/dimensionalOS/zenoh-gateway@<commit>/client/zenoh_gateway.ts"
+import { connect } from "./zenoh_gateway.js" // zenoh-gateway's client/zenoh_gateway.ts, bundled or vendored (see its SPEC.md, "Client")
 const z = await connect("http://robot.local:7448")
 z.encodings   // [{ name: "dimos_lcm_depth", output: "fields" }, { name: "dimos_lcm_image", output: "video" }, ...]
 z.subscribe("dimos/camera/depth/sensor_msgs.Image", { encoding: "dimos_lcm_depth" }, (msg) => draw(msg.decoded))

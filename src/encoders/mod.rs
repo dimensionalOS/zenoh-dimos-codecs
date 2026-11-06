@@ -1,4 +1,4 @@
-//! Hardware video encoders for [zenoh-gateway](https://github.com/jeff-hykin/zenoh-gateway), as [`VideoEncoder`](zenoh_gateway::VideoEncoder)s for
+//! Hardware video encoders for [zenoh-gateway](https://github.com/dimensionalOS/zenoh-gateway), as [`VideoEncoder`](zenoh_gateway::VideoEncoder)s for
 //! [`ServerBuilder::video_encoder`](zenoh_gateway::ServerBuilder::video_encoder):
 //! - `videotoolbox` (feature): macOS VideoToolbox, the Mac's media engine;
 //! - `gstreamer` (feature): a GStreamer hardware encoder found at runtime, `nvv4l2h264enc` (Jetson), `nvh264enc`

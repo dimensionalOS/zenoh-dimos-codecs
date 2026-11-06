@@ -1,4 +1,4 @@
-//! zenoh-dimos-codecs: [zenoh-gateway](https://github.com/jeff-hykin/zenoh-gateway) codecs for ROS 2
+//! zenoh-dimos-codecs: [zenoh-gateway](https://github.com/dimensionalOS/zenoh-gateway) codecs for ROS 2
 //! (rmw_zenoh, CDR) and dimos (LCM) sensor messages, implemented through zenoh-gateway's public
 //! [`MessageEncoding`](zenoh_gateway::MessageEncoding) trait like any external one.
 //!

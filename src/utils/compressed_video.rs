@@ -48,7 +48,7 @@ impl Codec {
 /// either way the unit begins just after the `01`. A unit's trailing zero bytes belong to no unit (Annex B's
 /// `trailing_zero_8bits`, and a slice's `cabac_zero_word` padding) and are dropped, so the bytes handed on are the same
 /// whichever width the next start code has.
-pub(crate) fn nal_units(codec: Codec, data: &[u8]) -> Vec<(u8, &[u8])> {
+pub fn nal_units(codec: Codec, data: &[u8]) -> Vec<(u8, &[u8])> {
     let mut starts = Vec::new();
     let mut at = 0;
     while let Some(found) = data.get(at..).and_then(|rest| rest.windows(3).position(|window| window == [0, 0, 1])) {

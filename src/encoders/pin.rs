@@ -31,20 +31,55 @@ pub(crate) enum Stage {
     Encode,
 }
 
-/// The core for the `index`th pipeline of `stage`, out of `cores` (the process's own, in order).
+/// The cores a stage may use: decoding takes the front of the set and encoding the back, **disjoint**, so a decoder
+/// and an encoder can never be given the same core.
 ///
-/// Decoders count up from the first and encoders down from the last, so two cameras on four cores put their decoders
-/// on the first two and their encoders on the last two without either knowing about the other. With more pipelines
-/// than cores they wrap, which is the scheduler's problem again but at least a predictable one.
-pub(crate) fn core_for(stage: Stage, index: usize, cores: &[usize]) -> Option<usize> {
-    let count = cores.len();
-    if count == 0 {
-        return None;
+/// They were given the same core. The first version counted decoders up from the first core and encoders down from
+/// the last, which only avoids a collision while the two stages' numbering is aligned — and it is not: encoder
+/// instances are also made to *probe* an element and thrown away, so the encoder of a single camera was number 3
+/// while its decoder was number 0, and both resolved to the same core. One camera starved itself with three cores
+/// idle. Splitting the set makes that impossible rather than unlikely.
+///
+/// With an odd number of cores decoding takes the extra one (it is the more expensive stage); with one core there is
+/// nothing to split and both stages share it, which is what a single core means.
+pub(crate) fn cores_for(stage: Stage, cores: &[usize]) -> Vec<usize> {
+    if cores.len() < 2 {
+        return cores.to_vec();
     }
-    Some(match stage {
-        Stage::Decode => cores[index % count],
-        Stage::Encode => cores[count - 1 - (index % count)],
-    })
+    let split = cores.len().div_ceil(2);
+    match stage {
+        Stage::Decode => cores[..split].to_vec(),
+        // from the back, so the first encoder takes the last core
+        Stage::Encode => cores[split..].iter().rev().copied().collect(),
+    }
+}
+
+/// The core for the pipeline called `element`, which is the same core every time it is asked.
+///
+/// Assigned densely in the order the pipelines of a stage are first seen, not by their own numbers: those have gaps
+/// (a probe takes one) and gaps put two streams on one core. Remembered by name, so an encoder rebuilt for a new
+/// picture size comes back to the core it had — the whole point, since a rebuilt encoder landing somewhere new is
+/// what the external pinning could not prevent.
+pub(crate) fn core_for(stage: Stage, element: &str, cores: &[usize]) -> Option<usize> {
+    static ASSIGNED: std::sync::OnceLock<std::sync::Mutex<Assignments>> = std::sync::OnceLock::new();
+    let mut assigned = ASSIGNED.get_or_init(Default::default).lock().expect("the core assignments");
+    assign(stage, element, cores, &mut assigned)
+}
+
+/// Which pipeline has which core, by element name.
+type Assignments = std::collections::HashMap<String, usize>;
+
+/// [`core_for`] against a given set of assignments rather than the process's, so what it decides can be tested
+/// without the order other tests ran in deciding it too.
+fn assign(stage: Stage, element: &str, cores: &[usize], assigned: &mut Assignments) -> Option<usize> {
+    if let Some(core) = assigned.get(element) {
+        return Some(*core);
+    }
+    let within = cores_for(stage, cores);
+    // the next core of this stage that nothing has yet, counted among what this stage may use
+    let core = *within.get(assigned.values().filter(|core| within.contains(core)).count() % within.len().max(1))?;
+    assigned.insert(element.to_owned(), core);
+    Some(core)
 }
 
 /// A thread's name as Linux reports it: `comm` keeps 15 characters, and GStreamer appends `:src` to the element's.
@@ -55,19 +90,18 @@ pub(crate) fn thread_name(element: &str) -> String {
 
 /// Pins the streaming thread of the pipeline whose appsrc is called `element`, if pinning is on.
 ///
-/// `number` is the decoder's or encoder's own (the one in its element names), **not** a count of pipelines pinned: an
-/// encoder is rebuilt whenever its picture changes size, and it has to come back to the same core each time or the
-/// thing this exists to prevent happens on every resolution change.
+/// The core is remembered against `element`, so an encoder rebuilt for a new picture size comes back to the core it
+/// had: a rebuilt encoder landing somewhere new is the thing this exists to prevent.
 ///
 /// Called with the pipeline already `PLAYING` and nothing pushed into it yet. Reports what it did, and what it could
 /// not: a thread that cannot be found or pinned is a stream that runs where the scheduler likes, which is worth
 /// saying rather than leaving to be inferred from a frame rate.
-pub(crate) fn pin(stage: Stage, element: &str, number: u64) {
+pub(crate) fn pin(stage: Stage, element: &str) {
     if !pinning() {
         return;
     }
     let cores = reserved_cores();
-    let Some(core) = core_for(stage, number as usize, &cores) else {
+    let Some(core) = core_for(stage, element, &cores) else {
         log::warn!("ZDC_PIN_PIPELINES is set but this process has no cores to choose from; {element} runs where it is put");
         return;
     };
@@ -181,29 +215,53 @@ fn set_affinity(_tid: Thread, _core: usize) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Two cameras on four cores: each decoder on its own core from the front, each encoder from the back, and
-    /// neither needing to know about the other. The numbers are the pipelines' own, so a rebuilt encoder comes back
-    /// to the core it had.
+    /// **A decoder and an encoder must never be given the same core.** They were: the first version counted decoders
+    /// up from the first core and encoders down from the last, which collides as soon as the two stages' numbering
+    /// differs — and it does, because encoder instances are also made to probe an element and thrown away. One
+    /// camera's decoder (number 0) and its encoder (number 3) both landed on core 4 of 4-7, and the camera starved
+    /// itself at 20.7 fps with three cores idle. Disjoint sets make it impossible instead of unlikely.
     #[test]
-    fn two_streams_on_four_cores_take_a_core_each() {
+    fn a_decoder_and_an_encoder_never_share_a_core() {
         let cores = vec![4, 5, 6, 7];
-        assert_eq!(core_for(Stage::Decode, 0, &cores), Some(4));
-        assert_eq!(core_for(Stage::Decode, 1, &cores), Some(5));
-        assert_eq!(core_for(Stage::Encode, 0, &cores), Some(7));
-        assert_eq!(core_for(Stage::Encode, 1, &cores), Some(6));
-        // the same number gives the same core however many times it is asked, which is what a rebuild relies on
-        assert_eq!(core_for(Stage::Encode, 0, &cores), Some(7));
+        let (decode, encode) = (cores_for(Stage::Decode, &cores), cores_for(Stage::Encode, &cores));
+        assert_eq!((decode.clone(), encode.clone()), (vec![4, 5], vec![7, 6]), "the front for decoding, the back for encoding");
+        assert!(decode.iter().all(|core| !encode.contains(core)), "nothing in common, whatever the numbering");
     }
 
-    /// It can only ever use what the process was given, and says nothing is possible rather than guessing.
+    /// Two cores is one each; one core cannot be split, and a set it was not given cannot be reached.
     #[test]
     fn it_stays_inside_the_cores_it_was_given() {
-        assert_eq!(core_for(Stage::Decode, 0, &[]), None, "no cores, no pinning");
-        assert_eq!(core_for(Stage::Decode, 0, &[6]), Some(6));
-        assert_eq!(core_for(Stage::Encode, 3, &[6]), Some(6), "one core takes everything");
-        // more pipelines than cores wrap rather than running off the end
-        let cores = vec![4, 5];
-        assert_eq!((core_for(Stage::Decode, 2, &cores), core_for(Stage::Encode, 2, &cores)), (Some(4), Some(5)));
+        assert_eq!(cores_for(Stage::Decode, &[4, 5]), vec![4], "two cores, one each");
+        assert_eq!(cores_for(Stage::Encode, &[4, 5]), vec![5]);
+        // an odd set gives decoding the extra core, it being the dearer stage
+        assert_eq!((cores_for(Stage::Decode, &[4, 5, 6]), cores_for(Stage::Encode, &[4, 5, 6])), (vec![4, 5], vec![6]));
+        // and with one core there is nothing to split
+        assert_eq!((cores_for(Stage::Decode, &[6]), cores_for(Stage::Encode, &[6])), (vec![6], vec![6]));
+        assert!(cores_for(Stage::Decode, &[]).is_empty());
+    }
+
+    /// Cores are handed out in the order pipelines are first seen, not by their own numbers, because those have gaps
+    /// — and a gap put two streams on one core. The same element always gets the same core back, which is what an
+    /// encoder rebuilt for a new picture size relies on.
+    #[test]
+    fn each_pipeline_keeps_the_core_it_was_given() {
+        let cores = vec![4, 5, 6, 7];
+        // its own assignments, so what another test did cannot change what this one sees
+        let mut assigned = Assignments::default();
+        // the numbers here are deliberately gappy, as a probe or a rebuild leaves them
+        let front_decode = assign(Stage::Decode, "h265src0", &cores, &mut assigned);
+        let front_encode = assign(Stage::Encode, "encsrc3", &cores, &mut assigned);
+        let rear_decode = assign(Stage::Decode, "h265src1", &cores, &mut assigned);
+        let rear_encode = assign(Stage::Encode, "encsrc9", &cores, &mut assigned);
+        assert_eq!((front_decode, rear_decode), (Some(4), Some(5)), "a core each, densely, whatever the numbers say");
+        assert_eq!((front_encode, rear_encode), (Some(7), Some(6)));
+        let four = [front_decode, front_encode, rear_decode, rear_encode];
+        assert_eq!(four.iter().flatten().collect::<std::collections::BTreeSet<_>>().len(), 4, "four pipelines, four cores");
+        // asked again — a rebuilt encoder — it comes back to the same core
+        assert_eq!(assign(Stage::Encode, "encsrc3", &cores, &mut assigned), front_encode);
+        assert_eq!(assign(Stage::Decode, "h265src0", &cores, &mut assigned), front_decode);
+        // and a third camera on four cores wraps within its stage rather than running off the end
+        assert_eq!(assign(Stage::Decode, "h265src2", &cores, &mut assigned), Some(4));
     }
 
     /// Linux keeps 15 characters of a thread's name, so what to look for is the truncation and not the whole.

@@ -101,6 +101,53 @@ fn keep_publishing(session: &zenoh::Session, key: &str) -> tokio::task::JoinHand
     })
 }
 
+/// The other half: a client with no HEVC decoder (Firefox) asks for `video-h264`, so the gateway decodes the stream
+/// with its stateful decoder and encodes it again. The per-sample decode could only manage keyframes, about one a
+/// second, so again the assertion that matters is that far more than that arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_without_hevc_gets_every_frame_re_encoded() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let _publisher = keep_publishing(&session, "camera/front");
+    let client = Client::connect(&url, ClientOptions::default()).await?;
+    let options = SubscribeOptions { encoding: Some("ros2_compressed_video".to_owned()), channel: Some("video-h264".to_owned()), metadata: Some(true), ..Default::default() };
+    let mut camera = client.subscribe("camera/front", options).await?;
+
+    let (mut frames, mut info) = (0usize, Vec::new());
+    let started = Instant::now();
+    while frames < 20 && started.elapsed() < Duration::from_secs(25) {
+        match tokio::time::timeout(Duration::from_secs(12), camera.recv()).await {
+            Ok(Some(Message::Video(frame))) => {
+                assert_eq!(frame.format, zenoh_gateway::VideoFormat::H264, "re-encoded to H.264 for a browser with no HEVC");
+                frames += 1;
+            }
+            Ok(Some(Message::VideoInfo(frame))) => info.push(frame),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let elapsed = started.elapsed();
+    // the publisher sends one keyframe per 30 frames at 30 Hz, so a keyframes-only decode would manage about one a
+    // second: 20 frames in well under 20 s can only mean predicted frames were decoded
+    assert!(frames >= 20, "only {frames} re-encoded frames in {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(15), "{frames} frames took {elapsed:?}: that is keyframe pace, so the stateful decode is not working");
+    // the pictures are the camera's own size, decoded rather than read off an SPS
+    let sized = info.iter().find(|frame| frame.source_width > 0).expect("metadata with a source size");
+    assert_eq!((sized.source_width, sized.source_height), (1280, 720));
+    // and no sample was dropped from under the decoder, which would have cost a resync
+    let stats = client.stats().await?;
+    let resyncs = stats["channels"].as_array().and_then(|channels| channels.first()).map(|channel| channel["stats"]["streamResyncs"].as_u64().unwrap_or(0)).unwrap_or(0);
+    assert_eq!(resyncs, 0, "the decoder had to start over {resyncs} times; stats: {}", stats["channels"]);
+
+    drop(camera);
+    client.close().await;
+    running.shutdown().await?;
+    Ok(())
+}
+
 /// Predicted frames reach the browser, which is the whole point: the keyframes-only decode could deliver one frame per
 /// keyframe, so anything over that is a frame that used to be lost.
 #[tokio::test(flavor = "multi_thread")]

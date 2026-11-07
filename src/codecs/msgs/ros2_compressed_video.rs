@@ -5,7 +5,8 @@ use super::CompressedVideo;
 use crate::utils::{cdr::Cdr, compressed_video};
 use anyhow::Result;
 use crate::utils::video_passthrough::H265Passthrough;
-use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, VideoEncoder, VideoFormat};
+use crate::utils::video_stream::CompressedVideoStream;
+use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, StreamDecoder, VideoEncoder, VideoFormat};
 
 /// `ros2_compressed_video`
 pub struct Ros2CompressedVideo;
@@ -47,6 +48,14 @@ impl MessageEncoding for Ros2CompressedVideo {
     /// play too (`video-h265`; only Chrome and Safari offer it, see the client's `playableChannel`).
     fn video_encoder(&self, format: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
         (format == VideoFormat::H265).then(|| Box::new(H265Passthrough::default()) as Box<dyn VideoEncoder>)
+    }
+
+    /// Anywhere the stream is decoded rather than passed through, one decoder keeps its state so predicted frames
+    /// decode too — without it only keyframes play, about one a second. A passthrough channel needs none: the browser's
+    /// own decoder keeps the state there.
+    fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
+        let decoded_here = matches!(channel, Channel::Video(format) if !format.passthrough_only());
+        decoded_here.then(|| Box::new(CompressedVideoStream::new(parse)) as Box<dyn StreamDecoder>)
     }
 }
 

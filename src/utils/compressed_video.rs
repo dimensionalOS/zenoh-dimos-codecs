@@ -154,6 +154,24 @@ pub fn to_access_unit(data: &[u8], format: &str) -> Result<AccessUnit> {
     Ok(AccessUnit { codec, data: normalized, keyframe, parameter_sets: (!parameter_sets.is_empty()).then_some(parameter_sets), size })
 }
 
+/// The bytes a decoder can be handed for `unit`, and whether it can start from them.
+///
+/// The camera's own stream carries no parameter sets in band: the only ones anybody sees are the extradata the publisher
+/// prepends to a keyframe. So `sets` remembers the newest, and a keyframe that arrives without them gets them put back
+/// in front — otherwise a consumer that joined between one keyframe and the next has nothing to start from, and a
+/// decoder would wait for a keyframe that never comes complete.
+pub fn decodable(unit: &AccessUnit, sets: &mut Option<Vec<u8>>) -> (Vec<u8>, bool) {
+    if let Some(carried) = &unit.parameter_sets {
+        *sets = Some(carried.clone());
+    }
+    match (unit.keyframe, unit.parameter_sets.is_none(), sets.as_ref()) {
+        // a keyframe without its parameter sets, and some remembered: put them in front and it decodes on its own
+        (true, true, Some(remembered)) => ([remembered.as_slice(), unit.data.as_slice()].concat(), true),
+        // a keyframe that carries its own, or one with none to be had (nothing can start from that), or any other frame
+        (keyframe, _, sets) => (unit.data.clone(), keyframe && sets.is_some()),
+    }
+}
+
 /// The picture in one access unit of `format` (`h264` or `h265`).
 pub fn to_video(data: &[u8], format: &str) -> Result<VideoImage> {
     let codec = Codec::from_format(format)?;

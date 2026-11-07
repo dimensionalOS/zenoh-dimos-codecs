@@ -16,6 +16,7 @@ pub mod png;
 pub mod pointcloud;
 pub mod raw_pixels;
 pub mod video_passthrough;
+pub mod video_stream;
 pub mod webp;
 
 #[cfg(test)]

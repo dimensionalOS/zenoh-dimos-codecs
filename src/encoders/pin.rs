@@ -75,7 +75,16 @@ pub(crate) fn pin(stage: Stage, element: &str, number: u64) {
     match wait_for_threads(&name) {
         found if found.is_empty() => log::warn!("ZDC_PIN_PIPELINES: no thread called {name} within {APPEAR_WITHIN:?}, so {element} was not put on core {core} and runs where the scheduler likes"),
         found => {
-            // more than one means the decoder has already made worker threads, which inherit what is set here
+            // More than one thread of that name is a decoder that has made workers, one per core, which all end up
+            // here: the ones already made are pinned now and the ones made later inherit it. Confining a whole pool
+            // to one core is slower than leaving it alone, so this is worth saying rather than discovering as a frame
+            // rate. Measured: `avdec_h265` with its default threading made 16 of them on a 16-core machine.
+            if found.len() > 1 {
+                log::warn!(
+                    "{element} has {} threads, so pinning puts its whole worker pool on core {core} — that is slower than not pinning. Give the decoder one worker (`ZDC_H265_GST_DECODER=\"avdec_h265 max-threads=1\"`) or turn ZDC_PIN_PIPELINES off",
+                    found.len()
+                );
+            }
             for tid in &found {
                 match set_affinity(*tid, core) {
                     Ok(()) => log::info!("{element} runs on core {core} (thread {name}, tid {tid})"),

@@ -759,7 +759,11 @@ impl H265Decoder {
         if self.pipeline.is_none() {
             // framerate 0/1: the decoder is driven by what is pushed, not by a clock
             let description = format!(
-                "appsrc name=source is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 ! {} ! video/x-raw,format=I420 ! appsink name=sink sync=false",
+                // `videoconvert` because a decoder gives whichever layout it likes and the gateway's pictures are
+                // I420: libav's gives I420 already and the element is then a passthrough costing nothing, while a
+                // hardware one (`mppvideodec` on an RK3588) gives NV12 and would otherwise refuse to negotiate at all.
+                // Where the conversion does run it is worth having a hardware one in front of it (`rgaconvert`).
+                "appsrc name=source is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 ! {} ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink sync=false",
                 self.element
             );
             let (pipeline, source, sink) = launch(self.api, &description)?;

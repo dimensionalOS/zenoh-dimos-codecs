@@ -133,3 +133,64 @@ fn a_named_gstreamer_encoder_is_selected_and_measured() {
     println!("x264enc: {encoded} frames of {width}x{height} in {:.0} ms = {:.1} fps ({:.1} ms/frame)", elapsed * 1000.0, encoded as f64 / elapsed, elapsed * 1000.0 / encoded.max(1) as f64);
     assert!(encoded > 20, "only {encoded} frames encoded");
 }
+
+/// How much latency the GStreamer encoder holds, which is a different question from how fast it is.
+///
+/// `GstreamerEncoder::encode` pushes a frame and only *waits* for output once `MAX_IN_FLIGHT` frames are inside;
+/// before that it takes whatever is already out, which for a 1-in-1-out encoder is nothing. That exists for hardware
+/// encoders that take several frame times per frame. For a software encoder in zerolatency mode it is pure added
+/// delay — and worse, the gateway measures the wall time of `encode` as the encoder's cost, so queueing shows up as
+/// encode time and the CPU governor shrinks the picture in response.
+///
+/// So: feed frames at the rate a camera sends them and report how many frames the encoder is holding and how long
+/// each call takes. Standing depth near `MAX_IN_FLIGHT` means ~that many frame intervals of latency by construction.
+#[test]
+#[cfg(feature = "gstreamer")]
+fn how_many_frames_the_gstreamer_encoder_holds() {
+    use zenoh_dimos_codecs::encoders::{Backend, select};
+    // SAFETY: single-threaded test
+    unsafe { std::env::set_var("ZDC_VIDEO_ENCODER", "x264enc") };
+    let selected = select(Backend::Auto).expect("auto selects something");
+    // SAFETY: as above
+    unsafe { std::env::remove_var("ZDC_VIDEO_ENCODER") };
+    let Some(factory) = selected.factory.filter(|_| selected.name.contains("x264enc")) else {
+        println!("x264enc not selected here ({}): nothing to measure", selected.name);
+        return;
+    };
+
+    let pictures = pictures();
+    if pictures.is_empty() {
+        return;
+    }
+    let (width, height) = (pictures[0].width(), pictures[0].height());
+    let target = VideoTarget::new(width, height, 4_000_000, 30.0);
+    let mut encoder = factory();
+    let frame_interval = std::time::Duration::from_millis(33);
+
+    let (mut out, mut none_before_first, mut first_seen) = (0usize, 0usize, false);
+    let mut call_ms: Vec<f64> = Vec::new();
+    for round in 0..90 {
+        let picture = &pictures[round % pictures.len()];
+        let at = Instant::now();
+        let got = encoder.encode(&DecodedFrame::Video(picture.clone()), &target).expect("encode");
+        call_ms.push(at.elapsed().as_secs_f64() * 1000.0);
+        match got {
+            Some(_) => {
+                out += 1;
+                first_seen = true;
+            }
+            None if !first_seen => none_before_first += 1,
+            None => {}
+        }
+        // a camera's pace, so the measurement is about holding rather than throughput
+        std::thread::sleep(frame_interval.saturating_sub(at.elapsed()));
+    }
+    call_ms.sort_by(f64::total_cmp);
+    let p50 = call_ms[call_ms.len() / 2];
+    let max = call_ms[call_ms.len() - 1];
+    println!("x264enc at {width}x{height}, fed at 30 Hz for 90 frames:");
+    println!("  frames out: {out} of 90   held back before the first came out: {none_before_first}");
+    println!("  encode() call: p50 {p50:.1} ms, max {max:.1} ms");
+    println!("  => the gateway reads that call time as the encoder's cost; its governor shrinks the picture past ~28 ms");
+    assert!(out > 60, "only {out} of 90 frames came out");
+}

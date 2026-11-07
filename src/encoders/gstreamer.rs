@@ -412,8 +412,21 @@ impl Pipeline {
             let by_name = |name: &str| (api.bin_get_by_name)(pipeline, c_string(name).as_ptr());
             let mut pipeline = Pipeline { api, pipeline, source: by_name("source"), sink: by_name("sink"), encoder: by_name("encoder"), element, size: (width, height), jpeg, fps, bitrate_bps: 0, inside: VecDeque::new() };
             ensure!(!pipeline.source.is_null() && !pipeline.sink.is_null() && !pipeline.encoder.is_null(), "GStreamer pipeline lost its elements");
+            // what the encoder was actually configured with, once per pipeline. A property that does not apply leaves
+            // the encoder on its defaults, which for x264enc means `preset=medium` with lookahead and B-frames - tens
+            // of times slower than `ultrafast` and seconds of latency - and nothing about the stream says why. So say
+            // which landed and which did not, rather than leaving it to be inferred from the frame rate.
+            let mut applied = Vec::new();
+            let mut missing = Vec::new();
             for (name, value) in element.settings {
-                pipeline.set(name, value);
+                if pipeline.set(name, value) { applied.push(format!("{name}={value}")) } else { missing.push(*name) }
+            }
+            // the bitrate too: it comes from the allocator's grant, not this table, and a tiny one explains a small
+            // picture on its own - the policy shrinks to hold its bits per pixel - without the encoder being at fault
+            applied.push(format!("bitrate={}{}", if element.kbps { bitrate_bps.div_ceil(1000) } else { bitrate_bps }, if element.kbps { "kbit/s" } else { "bit/s" }));
+            log::info!("GStreamer {}: {}", element.name, applied.join(" "));
+            if !missing.is_empty() {
+                log::warn!("GStreamer {}: no property {} - it keeps its default there, which for an encoder is usually much slower", element.name, missing.join(", "));
             }
             let interval = ((fps * super::KEYFRAME_SECONDS).ceil() as u32).max(1).to_string();
             for name in element.keyframe_interval {
@@ -425,18 +438,19 @@ impl Pipeline {
         }
     }
 
-    /// Sets an encoder property from its string form, if the installed version has it.
-    fn set(&self, name: &str, value: &str) {
+    /// Sets an encoder property from its string form; `false` if the installed version has no such property, in which
+    /// case the encoder keeps its default and the caller should say so.
+    fn set(&self, name: &str, value: &str) -> bool {
         let name = c_string(name);
         // SAFETY: a GObject's first field is its class pointer
         unsafe {
             let class = *(self.encoder as *const Pointer);
             if (self.api.class_find_property)(class, name.as_ptr()).is_null() {
-                log::debug!("{}: no property {name:?}", self.element.name);
-                return;
+                return false;
             }
             (self.api.util_set_object_arg)(self.encoder, name.as_ptr(), c_string(value).as_ptr());
         }
+        true
     }
 
     fn set_bitrate(&mut self, bitrate_bps: u32) {

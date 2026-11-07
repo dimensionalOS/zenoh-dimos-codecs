@@ -50,6 +50,7 @@ required-features = ["gstreamer"]
 # tests/h265_passthrough runs the Rust client against an in-process server
 zenoh-gateway = { version = "0.5.37", features = ["client"] }
 tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
 
 [patch.crates-io]
 # zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor

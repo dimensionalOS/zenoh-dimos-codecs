@@ -164,10 +164,14 @@ async fn a_client_without_hevc_gets_every_frame_re_encoded() -> Result<()> {
     // the pictures are the camera's own size, decoded rather than read off an SPS
     let sized = info.iter().find(|frame| frame.source_width > 0).expect("metadata with a source size");
     assert_eq!((sized.source_width, sized.source_height), (1280, 720));
-    // and no sample was dropped from under the decoder, which would have cost a resync
+    // Resyncs, but not a storm of them. A machine that cannot encode this picture at this rate *should* drop samples
+    // and resync - that is the stream degrading honestly, not a defect, and a debug build on a developer machine does
+    // exactly that once the picture is full size. What would be a defect is resyncing faster than frames arrive, which
+    // is what the read-ahead bug did. (This asserted zero until the grant ratchet was fixed, and passed only because
+    // the ratchet had shrunk the picture to something a slow build could keep up with - green for the wrong reason.)
     let stats = client.stats().await?;
     let resyncs = stats["channels"].as_array().and_then(|channels| channels.first()).map(|channel| channel["stats"]["streamResyncs"].as_u64().unwrap_or(0)).unwrap_or(0);
-    assert_eq!(resyncs, 0, "the decoder had to start over {resyncs} times; stats: {}", stats["channels"]);
+    assert!(resyncs as usize * 5 < frames, "the decoder started over {resyncs} times for {frames} frames; stats: {}", stats["channels"]);
 
     drop(camera);
     client.close().await;
@@ -464,6 +468,68 @@ async fn two_cameras_transcoded_at_once_both_hold_their_rate() -> Result<()> {
 
     drop(front);
     drop(rear);
+    client.close().await;
+    running.shutdown().await?;
+    Ok(())
+}
+
+/// A transcoded stream must not shrink its own picture away over time.
+///
+/// `reserved()` asks the allocator to reserve a stream's *measured* rate rather than offer it a grant it could not
+/// meet, which is right for audio and for a passthrough stream: what they send does not depend on what they are
+/// granted. A re-encoded stream is not like that. Its grant sets the encoder's bitrate, the bitrate sets how many
+/// bytes it sends, and `usage` then reports those bytes as the whole of its demand - so a picture that shrinks once,
+/// for any reason, is granted less, shrinks again, and has nothing pulling it back.
+///
+/// **This exhibits that only where something supplies the first shrink.** A debug build is slow enough that the CPU
+/// governor does, and then the grant stays at a twentieth of what 720p needs; a release build on a fast machine never
+/// starts, so it passes either way - checked, by putting the bug back. The guard that actually catches it is
+/// `subscription::tests::a_re_encoded_stream_is_never_thinned_but_never_reserved`, which tests the two predicates
+/// rather than waiting for a machine slow enough to show the consequence. This stays as the end-to-end witness that
+/// a transcoded stream reaches full size at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transcoded_stream_keeps_its_picture() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let _publisher = keep_publishing_as(&session, "camera/front", compressed_video_lcm);
+    let client = Client::connect(&url, ClientOptions::default()).await?;
+    let options = SubscribeOptions {
+        encoding: Some("dimos_lcm_compressed_video".to_owned()),
+        channel: Some("video-h264".to_owned()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut camera = client.subscribe("camera/front", options).await?;
+
+    // read frames for a while, sampling what the allocator grants and what size the picture is
+    let mut samples = Vec::new();
+    for _ in 0..6 {
+        let _ = take_frames(&mut camera, zenoh_gateway::VideoFormat::H264).await;
+        let stats = client.stats().await?;
+        if let Some(channel) = stats["channels"].as_array().and_then(|channels| channels.first()) {
+            let number = |name: &str| channel["stats"][name].as_f64().unwrap_or(0.0);
+            samples.push((channel["allocation"]["demandBytesPerSec"].as_f64().unwrap_or(0.0), number("videoWidth"), number("videoHeight"), channel["allocation"]["budgetBytesPerSec"].as_f64().unwrap_or(0.0)));
+        }
+    }
+    for (demand, width, height, budget) in &samples {
+        eprintln!("asks for {demand:>12.0} B/s   granted {budget:>10.0} B/s   picture {width:>6.0}x{height:.0}");
+    }
+
+    // What the fix guarantees is that the grant is not pinned to the bytes the stream is already sending, so the
+    // assertion is about the allocator's willingness rather than a picture size - which also depends on how fast the
+    // build and the machine are, and would make this test pass or fail for the wrong reasons. 720p at 30 Hz wants
+    // ~190 kB/s; the ratchet held this stream at 6-26 kB/s on both a developer machine and the robot, and never
+    // climbed. Anything well clear of that could only come from a demand the stream can grow into.
+    // The demand, not the grant or the picture: it is what the fix changes, and unlike the other two it does not
+    // depend on how fast this machine encodes. While the stream was reserved its demand *was* the bytes it had just
+    // sent, so a shrunken picture could only ask for less; now it is priced from the quality it wants, which is far
+    // more than a shrunken stream sends and is what lets it climb back. 720p at 30 Hz wants ~190 kB/s.
+    let best = samples.iter().map(|(demand, ..)| *demand).fold(0.0, f64::max);
+    assert!(best > 500_000.0, "the stream never asked for more than {best:.0} B/s, so it cannot grow into 720p: {samples:?}");
+    drop(camera);
     client.close().await;
     running.shutdown().await?;
     Ok(())

@@ -407,3 +407,64 @@ async fn frames_keep_coming_when_the_publisher_outruns_the_encoder() -> Result<(
     running.shutdown().await?;
     Ok(())
 }
+
+/// Two cameras transcoded at once on one connection, which is what a browser showing front and rear does: two
+/// subscriptions, two stream decoders and two encode sessions, sharing nothing but the connection's pacer. Neither may
+/// be starved by the other.
+///
+/// **This does not reproduce the robot's dual-camera problem**, where the second stream ran at a third of the first's
+/// rate. It was written to, and both streams come out within a millisecond of each other here — with openh264 and with
+/// x264enc, and with the cores pinned to match. So it is a guard against one stream starving another, not evidence
+/// about that failure, and it should not be read as covering it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_cameras_transcoded_at_once_both_hold_their_rate() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let _front = keep_publishing_as(&session, "camera/front", compressed_video_lcm);
+    let _rear = keep_publishing_as(&session, "camera/rear", compressed_video_lcm);
+    // one client, as one browser is: both tracks on one peer connection
+    let client = Client::connect(&url, ClientOptions::default()).await?;
+    let options = || SubscribeOptions {
+        encoding: Some("dimos_lcm_compressed_video".to_owned()),
+        channel: Some("video-h264".to_owned()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut front = client.subscribe("camera/front", options()).await?;
+    let mut rear = client.subscribe("camera/rear", options()).await?;
+
+    let started = Instant::now();
+    let (front_side, rear_side) = tokio::join!(
+        take_frames(&mut front, zenoh_gateway::VideoFormat::H264),
+        take_frames(&mut rear, zenoh_gateway::VideoFormat::H264),
+    );
+    let elapsed = started.elapsed();
+    let (front_frames, _, front_time) = front_side;
+    let (rear_frames, _, rear_time) = rear_side;
+    let stats = client.stats().await?;
+    let per_key = |key: &str| {
+        stats["channels"]
+            .as_array()
+            .and_then(|channels| channels.iter().find(|channel| channel["key"].as_str() == Some(key)))
+            .map(|channel| channel["stats"].to_string())
+            .unwrap_or_default()
+    };
+    eprintln!("front: {front_frames} frames in {front_time:?}\n  {}", per_key("camera/front"));
+    eprintln!("rear:  {rear_frames} frames in {rear_time:?}\n  {}", per_key("camera/rear"));
+    eprintln!("both done in {elapsed:?}");
+
+    // neither may be starved by the other: both are asked for the same number of frames, so both should take about as
+    // long. The robot saw the second at a third of the first's rate.
+    assert!(front_frames >= 15 && rear_frames >= 15, "front {front_frames}, rear {rear_frames}");
+    let (quick, slow) = (front_time.min(rear_time).as_secs_f64(), front_time.max(rear_time).as_secs_f64());
+    assert!(slow < quick * 2.0, "one stream took {slow:.1}s for the frames the other got in {quick:.1}s");
+
+    drop(front);
+    drop(rear);
+    client.close().await;
+    running.shutdown().await?;
+    Ok(())
+}

@@ -72,8 +72,8 @@ pub(crate) fn pin(stage: Stage, element: &str, number: u64) {
         return;
     };
     let name = thread_name(element);
-    match threads_named(&name) {
-        found if found.is_empty() => log::warn!("ZDC_PIN_PIPELINES: no thread called {name} to pin {element} to core {core}"),
+    match wait_for_threads(&name) {
+        found if found.is_empty() => log::warn!("ZDC_PIN_PIPELINES: no thread called {name} within {APPEAR_WITHIN:?}, so {element} was not put on core {core} and runs where the scheduler likes"),
         found => {
             // more than one means the decoder has already made worker threads, which inherit what is set here
             for tid in &found {
@@ -83,6 +83,24 @@ pub(crate) fn pin(stage: Stage, element: &str, number: u64) {
                 }
             }
         }
+    }
+}
+
+/// How long to let a pipeline's streaming thread appear. A pipeline reaching `PLAYING` has started its task, but the
+/// thread behind it is the scheduler's to create, and a state change can complete asynchronously — so this polls for
+/// it rather than assuming. Nothing has been pushed into the pipeline yet, so the wait costs a few milliseconds once
+/// per pipeline and buys the difference between a stream that is placed and one that silently is not.
+const APPEAR_WITHIN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The threads called `name`, once there are any or `APPEAR_WITHIN` has passed.
+fn wait_for_threads(name: &str) -> Vec<Thread> {
+    let until = std::time::Instant::now() + APPEAR_WITHIN;
+    loop {
+        let found = threads_named(name);
+        if !found.is_empty() || std::time::Instant::now() >= until {
+            return found;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -102,8 +120,14 @@ fn reserved_cores() -> Vec<usize> {
 
 /// The threads of this process called `name`. More than one means a decoder has already made workers, which inherit
 /// the affinity set on their parent.
+/// A thread of this process, as the kernel numbers them.
 #[cfg(target_os = "linux")]
-fn threads_named(name: &str) -> Vec<libc::pid_t> {
+type Thread = libc::pid_t;
+#[cfg(not(target_os = "linux"))]
+type Thread = i32;
+
+#[cfg(target_os = "linux")]
+fn threads_named(name: &str) -> Vec<Thread> {
     let Ok(entries) = std::fs::read_dir("/proc/self/task") else { return Vec::new() };
     entries
         .flatten()
@@ -116,7 +140,7 @@ fn threads_named(name: &str) -> Vec<libc::pid_t> {
 }
 
 #[cfg(target_os = "linux")]
-fn set_affinity(tid: libc::pid_t, core: usize) -> std::io::Result<()> {
+fn set_affinity(tid: Thread, core: usize) -> std::io::Result<()> {
     // SAFETY: a set with one core in it, applied to a thread of this process
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -135,12 +159,12 @@ fn reserved_cores() -> Vec<usize> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn threads_named(_name: &str) -> Vec<i32> {
+fn threads_named(_name: &str) -> Vec<Thread> {
     Vec::new()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_affinity(_tid: i32, _core: usize) -> std::io::Result<()> {
+fn set_affinity(_tid: Thread, _core: usize) -> std::io::Result<()> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "only Linux pins threads here"))
 }
 
@@ -179,6 +203,27 @@ mod tests {
         assert_eq!(thread_name("h265src0"), "h265src0:src");
         assert_eq!(thread_name("encsrc12"), "encsrc12:src");
         assert_eq!(thread_name("a_very_long_element_name").len(), 15, "15 characters, as `comm` keeps");
+    }
+
+    /// A thread that appears a moment after the pipeline started is still found, and one that never appears gives up
+    /// rather than holding the stream: a pipeline reaching `PLAYING` has started its task, but the thread behind it is
+    /// the scheduler's to make.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_that_appears_late_is_still_found() {
+        let (go, waiting) = std::sync::mpsc::channel::<()>();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::Builder::new().name("latepin:src".to_owned()).spawn(move || waiting.recv()).expect("a thread")
+        });
+        assert_eq!(wait_for_threads("latepin:src").len(), 1, "it waits for the thread to appear");
+        drop(go);
+        let _ = late.join().expect("the spawner").join();
+
+        // and a name that never appears costs the wait once, not the stream
+        let started = std::time::Instant::now();
+        assert!(wait_for_threads("nosuchthread:s").is_empty());
+        assert!(started.elapsed() < APPEAR_WITHIN * 3, "it gives up rather than waiting on nothing");
     }
 
     /// The lookup finds a thread by the name Linux reports, which is the half that cannot be reasoned about.

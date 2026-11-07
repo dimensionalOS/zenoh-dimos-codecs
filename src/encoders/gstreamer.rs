@@ -243,7 +243,14 @@ static X264: Element = Element { name: "x264enc", upload: "", kbps: true, settin
 pub(crate) const JPEG_ENCODER: &str = "nvv4l2h264enc";
 /// Frames inside the encoder before `encode` waits for one to come out: hardware encoders take a few frame times
 /// (nvv4l2h264enc ~40 ms on a loaded Orin), so waiting for each frame's own output capped a stream at ~25 fps.
-const MAX_IN_FLIGHT: u64 = 3;
+///
+/// It is also latency: a frame held is a frame not sent, and three of them at 30 Hz is up to 100 ms, which on a robot
+/// whose encode costs 1.6 ms buys nothing. The gateway drains what is inside between inputs, so the cost is usually
+/// less — `ZDC_GST_IN_FLIGHT` is there to measure what it actually is on a machine, against 1 and 0.
+fn max_in_flight() -> u64 {
+    static IN_FLIGHT: OnceLock<u64> = OnceLock::new();
+    *IN_FLIGHT.get_or_init(|| std::env::var("ZDC_GST_IN_FLIGHT").ok().and_then(|value| value.parse().ok()).unwrap_or(3))
+}
 /// The same for a pipeline that takes JPEG: its decoder, converter and encoder each hold frames (on the R1, ~40 ms from
 /// JPEG to H.264 idle, longer under load), and waiting for each output at 3 inside cost ~35 ms a frame, which zenoh-gateway's
 /// CPU governor took for encoding cost and shrank the picture for. `ZDC_GST_JPEG_IN_FLIGHT` overrides it.
@@ -483,7 +490,7 @@ impl Pipeline {
     }
 
     /// Pushes one picture (I420 in GStreamer's layout, or a JPEG) and takes the oldest access unit out: at once if one is
-    /// ready, waiting only once `MAX_IN_FLIGHT` frames are inside (every access unit comes out, in order, one per call).
+    /// ready, waiting only once [`max_in_flight`] frames are inside (every access unit comes out, in order, one per call).
     /// Returns it with its frame id.
     fn encode(&mut self, buffer: &[u8], keyframe: bool, frame_id: u64) -> Result<Option<(Vec<u8>, u64)>> {
         // SAFETY: the event is handed over to appsrc
@@ -497,7 +504,7 @@ impl Pipeline {
         }
         push(self.api, self.source, buffer)?;
         self.inside.push_back(frame_id);
-        let in_flight = if self.jpeg.is_some() { jpeg_in_flight() } else { MAX_IN_FLIGHT };
+        let in_flight = if self.jpeg.is_some() { jpeg_in_flight() } else { max_in_flight() };
         let timeout = if self.inside.len() as u64 > in_flight { OUTPUT_TIMEOUT } else { Duration::ZERO };
         let data = pull(self.api, self.sink, timeout)?;
         self.check_bus()?;
@@ -580,7 +587,7 @@ impl GstreamerEncoder {
 
     fn probe(&mut self) -> Result<()> {
         let (frame, target) = super::probe_frame()?;
-        for _ in 0..=MAX_IN_FLIGHT + 1 {
+        for _ in 0..=max_in_flight() + 1 {
             if self.encode(&frame, &target)?.is_some() {
                 return Ok(());
             }
@@ -1039,7 +1046,7 @@ mod tests {
         for (width, height) in [(128, 72), (64, 36), (640, 48), (320, 180)] {
             let image = zenoh_gateway::VideoImage::i420(width, height, vec![128; (width * height * 3 / 2) as usize]).unwrap();
             let target = VideoTarget::new(width, height, 300_000, 30.0);
-            let out = (0..=MAX_IN_FLIGHT + 1).find_map(|_| encoder.encode(&DecodedFrame::Video(image.clone()), &target).unwrap());
+            let out = (0..=max_in_flight() + 1).find_map(|_| encoder.encode(&DecodedFrame::Video(image.clone()), &target).unwrap());
             let out = out.unwrap_or_else(|| panic!("{width}x{height}: no frame came out"));
             assert!(out.width >= encoder.element.min_size.0 && out.height >= encoder.element.min_size.1, "{width}x{height} came out {}x{}", out.width, out.height);
         }

@@ -15,10 +15,10 @@
 use super::compressed_video::{self, Codec};
 use super::h265;
 use crate::codecs::msgs::{CompressedVideo, Header};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, ensure};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoImage};
+use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoFormat, VideoImage};
 
 /// How a compressed-video encoding reads its own wire format (`ros2_compressed_video`'s CDR,
 /// `dimos_lcm_compressed_video`'s LCM), so one decoder serves both.
@@ -128,6 +128,8 @@ impl Backend {
 /// libde265 and its threads for nothing.
 pub struct CompressedVideoStream {
     parse: Parse,
+    /// the video track's output format: an H.264 track fed an H.264 source passes it through (no decode); anything else is decoded
+    target: VideoFormat,
     h265: Option<Backend>,
     /// the newest parameter sets, to put back in front of a keyframe that arrives without them
     parameter_sets: Option<Vec<u8>>,
@@ -186,8 +188,8 @@ const HEADERS_MAX: usize = 8;
 
 impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
-    pub fn new(parse: Parse) -> Self {
-        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None, timings: Timings::default() }
+    pub fn new(parse: Parse, target: VideoFormat) -> Self {
+        CompressedVideoStream { parse, target, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None, timings: Timings::default() }
     }
 
     /// Decoder pipelines this stream has built, where its decoder builds one (GStreamer): **one** for a stream, for
@@ -217,14 +219,19 @@ impl StreamDecoder for CompressedVideoStream {
         self.timings.samples += 1;
         self.timings.parse += part.elapsed();
         if self.timings.samples >= STREAM_REPORT {
-            log::info!("H.265 stream {}", self.timings.line());
+            log::info!("video stream {}", self.timings.line());
             self.timings = Timings::default();
         }
-        match Codec::from_format(&message.format)? {
-            Codec::H265 => {}
-            // openh264's decoder would do the same job, but nothing here needs it yet and an untested path is worse
-            // than a clear refusal: H.264 keyframes still play through the per-sample decode.
-            Codec::H264 => bail!("this stream is H.264, which has no stateful decoder here (its keyframes still play one by one)"),
+        let source = Codec::from_format(&message.format)?;
+        // an H.264 source on an H.264 track is forwarded unchanged — no decode or re-encode (the whole point of the
+        // native relay): the access unit goes to the browser as it is, predicted frames and all. The H.264 output
+        // encoder (`H264Relay`) forwards it. H.264 to any other format has no stateful decoder here.
+        if source == Codec::H264 {
+            ensure!(self.target == VideoFormat::H264, "an H.264 stream can only be passed through to an H.264 track, not {:?}", self.target);
+            let unit = compressed_video::to_access_unit(message.data, &message.format)?;
+            self.last_frame_id = Some(frame_id);
+            self.timings.prepare += part.elapsed();
+            return Ok(Some(DecodedFrame::data(unit)));
         }
         let part = Instant::now();
         let unit = compressed_video::to_access_unit(message.data, &message.format)?;
@@ -387,7 +394,7 @@ mod tests {
             return;
         }
         let (keyframe, predicted) = capture();
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         // what one sample makes of itself, which is only visible while the decoder holds nothing back
         decoder.hold(0);
         let first = decode(&mut decoder, &keyframe, "h265").unwrap().expect("the keyframe decodes");
@@ -410,7 +417,7 @@ mod tests {
             return;
         }
         let (keyframe, predicted) = capture();
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         decoder.hold(0);
         // before any keyframe there is nothing to predict from
         assert!(decode(&mut decoder, &predicted[0], "h265").unwrap().is_none());
@@ -428,7 +435,7 @@ mod tests {
     #[test]
     fn every_picture_carries_the_header_of_its_own_sample() {
         let (keyframe, predicted) = capture();
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         let mut units = vec![keyframe];
         units.extend(predicted.iter().take(9).cloned());
         let mut pictures = Vec::new();
@@ -461,7 +468,7 @@ mod tests {
         // SAFETY: the variable is read only when a backend is made, and this asks for the default one
         unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
         let (keyframe, predicted) = capture();
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         let mut units = vec![keyframe];
         units.extend(predicted.iter().take(4).cloned());
         let mut held = 0;
@@ -487,7 +494,7 @@ mod tests {
         // SAFETY: single-threaded test, and the variable is read only when a backend is made
         unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
         let (keyframe, predicted) = capture();
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         decoder.hold(0);
         // this stream's own count, not the process-wide one: other tests in this binary have decoders of their own
         let before = decoder.pipelines_made();
@@ -529,9 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn says_why_it_cannot_take_h264() {
-        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+    fn passes_an_h264_source_through_on_an_h264_track() {
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H264);
+        let out = decode(&mut decoder, &fixture("compressed/pattern.h264"), "h264").unwrap().expect("a frame");
+        assert!(matches!(out, DecodedFrame::Data(_)), "an H.264 source on an H.264 track is forwarded, not decoded");
+        assert_eq!(decoder.last_frame_id(), Some(0));
+    }
+
+    #[test]
+    fn refuses_an_h264_source_on_a_non_h264_track() {
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         let error = decode(&mut decoder, &fixture("compressed/pattern.h264"), "h264").unwrap_err().to_string();
-        assert!(error.contains("no stateful decoder here"), "{error}");
+        assert!(error.contains("can only be passed through to an H.264 track"), "{error}");
     }
 }

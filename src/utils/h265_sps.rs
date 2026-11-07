@@ -11,7 +11,7 @@
 use anyhow::{Result, bail, ensure};
 
 /// Bits of an SPS payload, with H.265's emulation-prevention bytes already gone.
-struct Bits {
+pub(crate) struct Bits {
     /// the raw byte sequence payload (RBSP)
     bytes: Vec<u8>,
     /// how many bits have been read
@@ -21,7 +21,7 @@ struct Bits {
 impl Bits {
     /// The RBSP of one NAL unit payload: every `0x03` that follows `0x00 0x00` is an emulation-prevention byte the
     /// encoder added so the bytes could not look like a start code, and is not part of the syntax.
-    fn new(payload: &[u8]) -> Self {
+    pub(crate) fn new(payload: &[u8]) -> Self {
         let mut bytes = Vec::with_capacity(payload.len());
         let mut zeros = 0;
         for &byte in payload {
@@ -37,7 +37,7 @@ impl Bits {
 
     /// `count` bits, most significant first; fails past the end rather than reading zeros, so a truncated SPS says so
     /// instead of giving a plausible size.
-    fn bits(&mut self, count: usize) -> Result<u64> {
+    pub(crate) fn bits(&mut self, count: usize) -> Result<u64> {
         ensure!(count <= 64, "{count} bits at once");
         ensure!(self.at + count <= self.bytes.len() * 8, "the sequence parameter set ends after {} bits, needed {}", self.bytes.len() * 8, self.at + count);
         let mut value = 0u64;
@@ -50,12 +50,12 @@ impl Bits {
     }
 
     /// One bit as a flag.
-    fn flag(&mut self) -> Result<bool> {
+    pub(crate) fn flag(&mut self) -> Result<bool> {
         Ok(self.bits(1)? == 1)
     }
 
     /// An unsigned exp-Golomb code (`ue(v)`): the leading zeros say how many bits follow.
-    fn ue(&mut self) -> Result<u64> {
+    pub(crate) fn ue(&mut self) -> Result<u64> {
         let mut leading = 0;
         while !self.flag()? {
             leading += 1;
@@ -63,6 +63,12 @@ impl Bits {
             ensure!(leading <= 32, "the sequence parameter set is not exp-Golomb here ({leading} leading zeros)");
         }
         Ok((1u64 << leading) - 1 + self.bits(leading)?)
+    }
+
+    /// A signed exp-Golomb code (`se(v)`): maps the unsigned code k to 0, +1, -1, +2, -2, …
+    pub(crate) fn se(&mut self) -> Result<i64> {
+        let k = self.ue()?;
+        Ok(if k % 2 == 1 { ((k + 1) / 2) as i64 } else { -((k / 2) as i64) })
     }
 
     /// `profile_tier_level`, which sits between the sub-layer count and the sizes and is skipped whole.

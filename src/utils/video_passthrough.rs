@@ -19,28 +19,55 @@
 
 use super::compressed_video::{AccessUnit, Codec};
 use anyhow::{Result, anyhow, ensure};
-use zenoh_gateway::{DecodedFrame, EncodedVideo, VideoEncoder, VideoFormat, VideoTarget};
+use zenoh_gateway::{DecodedFrame, EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoTarget};
 
-/// Forwards already-encoded H.265 access units ([`AccessUnit`], from a compressed-video encoding's
-/// [`decode`](zenoh_gateway::MessageEncoding::decode) on a `video-h265` channel) to the gateway's track.
+/// The AU codec a passthrough format carries.
+fn codec_of(format: VideoFormat) -> Codec {
+    match format {
+        VideoFormat::H264 => Codec::H264,
+        _ => Codec::H265,
+    }
+}
+
+/// Forwards already-encoded H.264/H.265 access units ([`AccessUnit`], from a compressed-video encoding's
+/// [`decode`](zenoh_gateway::MessageEncoding::decode) on a video track whose format matches the source codec) to the
+/// gateway's track, instead of decoding and re-encoding them. For an already-encoded camera stream that is the whole
+/// cost, and passing the bytes through keeps every frame playable (the browser's decoder holds the reference chain)
+/// rather than one keyframe a second.
 ///
 /// One per encode session, so its remembered size and parameter sets follow one stream.
-#[derive(Debug, Default)]
-pub struct H265Passthrough {
+#[derive(Debug)]
+pub struct Passthrough {
+    format: VideoFormat,
     /// the newest size any sequence parameter set gave: frames between keyframes carry none
     size: Option<(u32, u32)>,
     /// the newest parameter sets seen, to put back in front of a keyframe that arrives without them
     parameter_sets: Option<Vec<u8>>,
 }
 
-impl VideoEncoder for H265Passthrough {
+/// The H.265 passthrough (the only format that is *always* passed through — there is no H.265 encoder here).
+pub type H265Passthrough = Passthrough;
+
+impl Default for Passthrough {
+    fn default() -> Self {
+        Passthrough::new(VideoFormat::H265)
+    }
+}
+
+impl Passthrough {
+    pub fn new(format: VideoFormat) -> Self {
+        Passthrough { format, size: None, parameter_sets: None }
+    }
+}
+
+impl VideoEncoder for Passthrough {
     fn format(&self) -> VideoFormat {
-        VideoFormat::H265
+        self.format
     }
 
     fn encode(&mut self, frame: &DecodedFrame, _target: &VideoTarget) -> Result<Option<EncodedVideo>> {
-        let unit: &AccessUnit = frame.downcast().map_err(|error| anyhow!("the H.265 passthrough encoder takes access units: {error:#}"))?;
-        ensure!(unit.codec == Codec::H265, "the H.265 passthrough encoder was handed {:?} data", unit.codec);
+        let unit: &AccessUnit = frame.downcast().map_err(|error| anyhow!("the {:?} passthrough encoder takes access units: {error:#}", self.format))?;
+        ensure!(unit.codec == codec_of(self.format), "the {:?} passthrough encoder was handed {:?} data", self.format, unit.codec);
         if let Some(sets) = &unit.parameter_sets {
             self.parameter_sets = Some(sets.clone());
         }
@@ -59,6 +86,59 @@ impl VideoEncoder for H265Passthrough {
         };
         let keyframe = unit.keyframe && (unit.parameter_sets.is_some() || self.parameter_sets.is_some());
         Ok(Some(EncodedVideo { data, width, height, keyframe }))
+    }
+}
+
+/// The H.264 output encoder: forwards an already-H.264 source access unit unchanged ([`Passthrough`]), and otherwise —
+/// an H.265 (or raw) source decoded to a picture — encodes it with the built-in software H.264 encoder
+/// ([`H264Encoder`]). So an H.264 camera costs the gateway nothing (zero transcode), while an H.265 camera still
+/// transcodes to H.264 for browsers with no HEVC. Which path a frame takes is decided upstream by the stream decoder:
+/// an [`AccessUnit`] (H.264 source) is forwarded, a `DecodedFrame::Video` (decoded picture) is encoded.
+#[derive(Default)]
+pub struct H264Relay {
+    passthrough: Passthrough,
+    encoder: H264Encoder,
+    /// whether the frame `encode` last handled was forwarded (so `last_qp`/`last_frame_id`/`next_output` only follow the
+    /// software encoder when it was the one that ran)
+    forwarded_last: bool,
+}
+
+impl H264Relay {
+    pub fn new() -> Self {
+        H264Relay { passthrough: Passthrough::new(VideoFormat::H264), encoder: H264Encoder::default(), forwarded_last: false }
+    }
+}
+
+impl VideoEncoder for H264Relay {
+    fn format(&self) -> VideoFormat {
+        VideoFormat::H264
+    }
+
+    fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
+        if matches!(frame, DecodedFrame::Video(_)) {
+            self.forwarded_last = false;
+            self.encoder.encode(frame, target)
+        } else {
+            self.forwarded_last = true;
+            self.passthrough.encode(frame, target)
+        }
+    }
+
+    fn last_qp(&self) -> Option<f64> {
+        (!self.forwarded_last).then(|| self.encoder.last_qp()).flatten()
+    }
+
+    fn last_frame_id(&self) -> Option<u64> {
+        (!self.forwarded_last).then(|| self.encoder.last_frame_id()).flatten()
+    }
+
+    fn next_output(&mut self, wait: std::time::Duration) -> Result<Option<EncodedVideo>> {
+        // a forwarded access unit is never pipelined; the software encoder may trail its input
+        if self.forwarded_last {
+            Ok(None)
+        } else {
+            self.encoder.next_output(wait)
+        }
     }
 }
 
@@ -129,5 +209,17 @@ mod tests {
         let h264 = to_access_unit(&fixture("compressed/pattern.h264"), "h264").unwrap();
         let error = encoder.encode(&frame(h264), &target).unwrap_err().to_string();
         assert!(error.contains("was handed H264 data"), "{error}");
+    }
+
+    #[test]
+    fn h264_relay_forwards_an_h264_source_unchanged() {
+        let data = fixture("compressed/pattern.h264");
+        let unit = to_access_unit(&data, "h264").unwrap();
+        let mut relay = H264Relay::new();
+        let encoded = relay.encode(&frame(unit.clone()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().expect("a frame");
+        assert_eq!((encoded.width, encoded.height), (320, 240), "the size comes from the H.264 SPS, not the target");
+        assert!(encoded.keyframe);
+        assert_eq!(encoded.data, unit.data, "the H.264 access unit goes out as it came in");
+        assert_eq!(relay.last_qp(), None, "a forwarded frame has no encoder quantizer");
     }
 }

@@ -4,7 +4,7 @@
 use super::CompressedVideo;
 use crate::utils::{compressed_video, lcm::Lcm};
 use anyhow::Result;
-use crate::utils::video_passthrough::H265Passthrough;
+use crate::utils::video_passthrough::{H264Relay, Passthrough};
 use crate::utils::video_stream::CompressedVideoStream;
 use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, StreamDecoder, VideoEncoder, VideoFormat};
 
@@ -52,15 +52,23 @@ impl MessageEncoding for DimosLcmCompressedVideo {
     /// H.265 straight to the browser, which decodes it in hardware: no decode and re-encode here, so predicted frames
     /// play too (`video-h265`; only Chrome and Safari offer it, see the client's `playableChannel`).
     fn video_encoder(&self, format: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
-        (format == VideoFormat::H265).then(|| Box::new(H265Passthrough::default()) as Box<dyn VideoEncoder>)
+        match format {
+            // H.265 is only ever passed through (no H.265 encoder here)
+            VideoFormat::H265 => Some(Box::new(Passthrough::new(VideoFormat::H265)) as Box<dyn VideoEncoder>),
+            // H.264 forwards an H.264 source unchanged, else encodes a decoded (H.265) picture with openh264
+            VideoFormat::H264 => Some(Box::new(H264Relay::new()) as Box<dyn VideoEncoder>),
+            _ => None,
+        }
     }
 
     /// Anywhere the stream is decoded rather than passed through, one decoder keeps its state so predicted frames
     /// decode too — without it only keyframes play, about one a second. A passthrough channel needs none: the browser's
     /// own decoder keeps the state there.
     fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
-        let decoded_here = matches!(channel, Channel::Video(format) if !format.passthrough_only());
-        decoded_here.then(|| Box::new(CompressedVideoStream::new(parse)) as Box<dyn StreamDecoder>)
+        // a passthrough-only format (H.265) keeps its state in the browser's own decoder, so no stream decoder here.
+        // Any other video format gets one: it forwards an already-matching source (H.264 → H.264) or decodes (H.265 → picture).
+        let Channel::Video(format) = channel else { return None };
+        (!format.passthrough_only()).then(|| Box::new(CompressedVideoStream::new(parse, format)) as Box<dyn StreamDecoder>)
     }
 }
 

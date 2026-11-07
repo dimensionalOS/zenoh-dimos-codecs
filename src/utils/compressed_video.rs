@@ -2,7 +2,7 @@
 //! the video encoder. Each sample is decoded on its own (the gateway decodes only the samples it sends), so a sample must
 //! be a keyframe carrying its parameter sets: a stream with predicted frames, or parameter sets sent once, can't play.
 
-use crate::utils::{h264, h265, h265_sps};
+use crate::utils::{h264, h264_sps, h265, h265_sps};
 use anyhow::{Result, bail, ensure};
 use zenoh_gateway::{Channel, VideoImage};
 
@@ -146,10 +146,10 @@ pub fn to_access_unit(data: &[u8], format: &str) -> Result<AccessUnit> {
         normalized.extend_from_slice(unit);
     }
     ensure!(!normalized.is_empty(), "{codec:?} data has no NAL unit a decoder could be sent (types {:?})", units.iter().map(|(kind, _)| *kind).collect::<Vec<_>>());
-    // the size lives in the SPS (H.265 type 33, H.264 type 7); only H.265 is passed through today, so only its is read
+    // the size lives in the SPS (H.265 type 33, H.264 type 7), the only place a passthrough stream carries it
     let size = match codec {
         Codec::H265 => units.iter().find(|(kind, _)| *kind == 33).map(|(_, unit)| h265_sps::picture_size(unit)).transpose()?,
-        Codec::H264 => None,
+        Codec::H264 => units.iter().find(|(kind, _)| *kind == 7).map(|(_, unit)| h264_sps::picture_size(unit)).transpose()?,
     };
     Ok(AccessUnit { codec, data: normalized, keyframe, parameter_sets: (!parameter_sets.is_empty()).then_some(parameter_sets), size })
 }
@@ -262,6 +262,15 @@ pub(crate) mod tests {
         assert!(check_decodable_alone(Codec::H264, b"no start code").is_err());
         assert!(Codec::from_format("vp9").is_err());
         assert_eq!(Codec::from_format(" HEVC ").unwrap(), Codec::H265);
+    }
+
+    #[test]
+    fn reads_the_h264_picture_size() {
+        let data = fixture("compressed/pattern.h264");
+        let unit = to_access_unit(&data, "h264").unwrap();
+        assert_eq!(unit.codec, Codec::H264);
+        assert_eq!(unit.size, Some((320, 240)), "the size comes from the H.264 SPS (NAL type 7)");
+        assert!(unit.keyframe);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod compressed_image;
 pub mod compressed_video;
 pub mod depth;
 pub mod h264;
+pub mod h264_sps;
 pub mod h265;
 pub mod h265_sps;
 pub mod jpeg;

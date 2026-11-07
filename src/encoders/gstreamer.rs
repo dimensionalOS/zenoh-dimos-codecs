@@ -717,6 +717,14 @@ impl H265Decoder {
         self.stop();
     }
 
+    /// Whether the next access unit has to be a keyframe, because there is no pipeline yet or the last one was thrown
+    /// away. **Check this before pushing**: a fresh pipeline fed a predicted frame produces nothing, and `decode` then
+    /// waits [`OUTPUT_TIMEOUT`] for that nothing — seconds, per frame, for as long as the keyframes are missed. That
+    /// turns a stream that should drop a second of pictures after a loss into one that delivers almost none.
+    pub fn needs_keyframe(&self) -> bool {
+        self.pipeline.is_none()
+    }
+
     /// Feeds one Annex-B access unit, which follows every unit fed before it, and returns the picture it completed as
     /// packed I420. `None`: nothing yet (no keyframe seen yet, or a unit that completes no picture).
     ///

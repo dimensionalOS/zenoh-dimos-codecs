@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use zenoh_dimos_codecs::codecs::msgs::dimos_lcm_compressed_video::DimosLcmCompressedVideo;
 use zenoh_dimos_codecs::codecs::msgs::ros2_compressed_video::Ros2CompressedVideo;
 use zenoh_gateway::client::{Client, ClientOptions, Message, SubscribeOptions};
 use zenoh_gateway::{RunningServer, Server, zenoh};
@@ -36,6 +37,27 @@ fn compressed_video_cdr(data: &[u8], format: &str) -> Vec<u8> {
     body.extend_from_slice(data);
     string(&mut body, format);
     [&[0x00, 0x01, 0x00, 0x00][..], &body].concat()
+}
+
+/// `foxglove_msgs.CompressedVideo` as dimos puts it on the wire: big-endian LCM behind its fingerprint — the data's
+/// length, the timestamp, the frame id, the data, then the format's name. This is the encoding the **robot** publishes;
+/// the CDR one above is what a ROS 2 system would.
+fn compressed_video_lcm(data: &[u8], format: &str) -> Vec<u8> {
+    /// the fingerprint `lcm-gen` computes for dimos-lcm's type, as the codec checks for
+    const FINGERPRINT: [u8; 8] = [0x22, 0x17, 0xb4, 0x6e, 0xef, 0xbf, 0x7b, 0x05];
+    let mut out = FINGERPRINT.to_vec();
+    let string = |out: &mut Vec<u8>, text: &str| {
+        out.extend_from_slice(&(text.len() as i32 + 1).to_be_bytes());
+        out.extend_from_slice(text.as_bytes());
+        out.push(0);
+    };
+    out.extend_from_slice(&(data.len() as i32).to_be_bytes());
+    out.extend_from_slice(&1_700_000_000i32.to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    string(&mut out, "camera_color_optical_frame");
+    out.extend_from_slice(data);
+    string(&mut out, format);
+    out
 }
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -77,7 +99,7 @@ fn isolated_config() -> zenoh::Config {
 
 async fn start() -> (RunningServer, zenoh::Session, String) {
     let session = zenoh::open(isolated_config()).await.unwrap();
-    let server = Server::builder().session(session.clone()).encoding(Ros2CompressedVideo).build().await.unwrap();
+    let server = Server::builder().session(session.clone()).encoding(Ros2CompressedVideo).encoding(DimosLcmCompressedVideo).build().await.unwrap();
     let running = server.bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", running.local_addr());
     (running, session, url)
@@ -86,6 +108,11 @@ async fn start() -> (RunningServer, zenoh::Session, String) {
 /// Publishes the robot's capture on `key` at 30 Hz until dropped: the keyframe with its parameter sets, then the
 /// predicted frames that follow it, over and over.
 fn keep_publishing(session: &zenoh::Session, key: &str) -> tokio::task::JoinHandle<()> {
+    keep_publishing_as(session, key, compressed_video_cdr)
+}
+
+/// As [`keep_publishing`], in whichever wire format `encode` writes.
+fn keep_publishing_as(session: &zenoh::Session, key: &str, encode: fn(&[u8], &str) -> Vec<u8>) -> tokio::task::JoinHandle<()> {
     let keyframe = fixture("compressed/m20_front_keyframe.h265");
     let predicted: Vec<Vec<u8>> = access_units(&fixture("compressed/m20_front_2s.h265")).into_iter().filter(|(keyframe, _)| !keyframe).map(|(_, unit)| unit).collect();
     assert!(predicted.len() > 20, "the capture has {} predicted frames", predicted.len());
@@ -93,7 +120,7 @@ fn keep_publishing(session: &zenoh::Session, key: &str) -> tokio::task::JoinHand
     tokio::spawn(async move {
         let frames: Vec<Vec<u8>> = [vec![keyframe], predicted].concat();
         for access_unit in frames.iter().cycle() {
-            if session.put(&key, compressed_video_cdr(access_unit, "h265")).await.is_err() {
+            if session.put(&key, encode(access_unit, "h265")).await.is_err() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(33)).await;
@@ -282,4 +309,101 @@ async fn take_frames(
         }
     }
     (frames, sizes, started.elapsed())
+}
+
+/// The LCM builder above must produce what the real parser reads, or a test built on it proves nothing.
+#[test]
+fn the_lcm_builder_round_trips_through_the_codec_s_own_parser() {
+    use zenoh_dimos_codecs::codecs::msgs::dimos_lcm_compressed_video::parse;
+    let data = fixture("compressed/m20_front_keyframe.h265");
+    let payload = compressed_video_lcm(&data, "h265");
+    let message = parse(&payload).expect("the codec parses what we built");
+    assert_eq!(message.format.as_str(), "h265");
+    assert_eq!(message.data, data.as_slice());
+    assert_eq!(message.header.frame_id, "camera_color_optical_frame");
+}
+
+/// The robot's own wire format through the re-encode path, which nothing covered: every end-to-end test above drives
+/// `ros2_compressed_video` (CDR), while the M20's camera publishes `dimos_lcm_compressed_video` (LCM). The two share
+/// their `decode` and `stream_decoder` wiring, so this ought to behave identically — and if it does not, the
+/// difference is the wire format and not the robot.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_robot_s_own_encoding_is_re_encoded_too() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let _publisher = keep_publishing_as(&session, "camera/front", compressed_video_lcm);
+    let client = Client::connect(&url, ClientOptions::default()).await?;
+    let options = SubscribeOptions {
+        encoding: Some("dimos_lcm_compressed_video".to_owned()),
+        channel: Some("video-h264".to_owned()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut camera = client.subscribe("camera/front", options).await?;
+    let (frames, sizes, elapsed) = take_frames(&mut camera, zenoh_gateway::VideoFormat::H264).await;
+
+    // when this fails, the gateway's own account of why is the whole point of asking for it
+    let stats = client.stats().await?;
+    let channel = stats["channels"].as_array().and_then(|channels| channels.first()).cloned().unwrap_or_default();
+    assert!(frames >= 15, "only {frames} re-encoded frames in {elapsed:?}; gateway says {}", channel["stats"]);
+    assert!(sizes.iter().all(|size| *size == (1280, 720)), "source sizes {sizes:?}");
+
+    drop(camera);
+    client.close().await;
+    running.shutdown().await?;
+    Ok(())
+}
+
+/// A publisher faster than the transcode can keep up with, so the sample queue never empties.
+///
+/// This is how the robot broke while every test here passed: at 30 Hz from a real camera the queue was never empty,
+/// and the send loop skipped encoding whenever anything was waiting — which was always — so it decoded forever and
+/// encoded nothing. Zero frames, no error, nothing in the log. The tests above all drain their queue on a fast
+/// machine, so none of them could see it.
+///
+/// What it asserts is only that frames keep coming when the input outruns the encoder. The stream is expected to
+/// degrade here — samples drop from the queue and the decoder resyncs — because 250 Hz of 720p is beyond any
+/// software transcode; what it must not do is stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn frames_keep_coming_when_the_publisher_outruns_the_encoder() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let keyframe = fixture("compressed/m20_front_keyframe.h265");
+    let predicted: Vec<Vec<u8>> = access_units(&fixture("compressed/m20_front_2s.h265")).into_iter().filter(|(keyframe, _)| !keyframe).map(|(_, unit)| unit).collect();
+    let flood = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            let frames: Vec<Vec<u8>> = [vec![keyframe], predicted].concat();
+            for access_unit in frames.iter().cycle() {
+                if session.put("camera/front", compressed_video_lcm(access_unit, "h265")).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+        })
+    };
+    let client = Client::connect(&url, ClientOptions::default()).await?;
+    let options = SubscribeOptions {
+        encoding: Some("dimos_lcm_compressed_video".to_owned()),
+        channel: Some("video-h264".to_owned()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut camera = client.subscribe("camera/front", options).await?;
+    let (frames, _, elapsed) = take_frames(&mut camera, zenoh_gateway::VideoFormat::H264).await;
+    let stats = client.stats().await?;
+    let channel = stats["channels"].as_array().and_then(|channels| channels.first()).cloned().unwrap_or_default();
+    assert!(frames >= 15, "only {frames} frames in {elapsed:?} with the queue always full; gateway says {}", channel["stats"]);
+
+    flood.abort();
+    drop(camera);
+    client.close().await;
+    running.shutdown().await?;
+    Ok(())
 }

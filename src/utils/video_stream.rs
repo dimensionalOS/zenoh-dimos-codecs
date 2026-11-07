@@ -39,18 +39,26 @@ impl Backend {
     /// `ZDC_H265_BACKEND=libde265` forces the fallback, to compare them on one machine.
     fn best() -> Result<Self> {
         let forced = std::env::var("ZDC_H265_BACKEND").unwrap_or_default();
+        // every branch below says which decoder it picked and why. The two differ by nearly twice in speed (~83 fps of
+        // 720p against ~50 on an RK3588 core), and a stale `ZDC_H265_BACKEND` in some unit file quietly costing that
+        // much is exactly the kind of thing that gets blamed on the hardware for an afternoon.
+        let mut why = String::new();
         #[cfg(feature = "gstreamer")]
-        if forced != "libde265" {
+        if forced == "libde265" {
+            why = " (ZDC_H265_BACKEND asks for it; GStreamer's is faster where it is installed)".to_owned();
+        } else {
             match crate::encoders::gstreamer::H265Decoder::new() {
                 Ok(decoder) => {
                     log::info!("H.265 stream decoding with GStreamer {}", decoder.element());
                     return Ok(Backend::Gstreamer(decoder));
                 }
-                Err(error) => log::info!("no GStreamer H.265 decoder ({error:#}), falling back to libde265"),
+                Err(error) => why = format!(" (no GStreamer H.265 decoder: {error:#})"),
             }
         }
         let _ = &forced;
-        Ok(Backend::Libde265(h265::Stream::new().context("no H.265 decoder: neither a GStreamer one nor libde265")?))
+        let stream = h265::Stream::new().context("no H.265 decoder: neither a GStreamer one nor libde265")?;
+        log::info!("H.265 stream decoding with libde265{why}");
+        Ok(Backend::Libde265(stream))
     }
 
     /// One access unit in, the picture it completed out. `keyframe`: it is decodable on its own.
@@ -61,11 +69,20 @@ impl Backend {
                 // GStreamer is handed the size because nothing in the pipeline reports it back; before any parameter
                 // set has said what it is there is also no keyframe to start from, so there is nothing to decode yet
                 let Some(size) = size else { return Ok(None) };
-                let _ = keyframe;
+                // a fresh pipeline cannot use a predicted frame, and pushing one anyway costs a full output timeout
+                // waiting for a picture that will never come - seconds per frame, which is far worse than the second
+                // of pictures a resync should cost
+                if decoder.needs_keyframe() && !keyframe {
+                    return Ok(None);
+                }
                 let Some(data) = decoder.decode(access_unit, size)? else { return Ok(None) };
                 VideoImage::i420(size.0, size.1, data).map(Some)
             }
-            Backend::Libde265(stream) => stream.push(access_unit, keyframe),
+            // libde265 reports its own picture size, so it has no use for `size` (which only GStreamer needs told)
+            Backend::Libde265(stream) => {
+                let _ = size;
+                stream.push(access_unit, keyframe)
+            }
         }
     }
 

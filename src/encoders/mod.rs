@@ -92,17 +92,26 @@ pub struct Selected {
 /// It is not tried unless asked for. `x264enc` is GPL, where openh264 is BSD-licensed with Cisco's patent grant, so
 /// which encoder a build uses is a decision for whoever ships it and not one to make by default. Naming the element
 /// rather than a backend also makes this the way to pin any encoder, e.g. to compare two on one machine.
+/// `" (no hardware one: ...)"` when hardware was looked for and not found, else nothing: a host that asked for
+/// software never looked, and saying "no hardware encoder" there would be a puzzle rather than a reason.
+fn hardware_note(failures: &[String]) -> String {
+    if failures.is_empty() { String::new() } else { format!(" (no hardware one: {})", failures.join("; ")) }
+}
+
 fn named_element() -> Option<String> {
     std::env::var("ZDC_VIDEO_ENCODER").ok().map(|name| name.trim().to_owned()).filter(|name| !name.is_empty())
 }
 
 /// Probes `backend` (with [`Backend::Auto`], each hardware one in turn) by encoding a test frame. An explicitly named
-/// backend that isn't built in or doesn't work is an error; `Auto` falls back to the element `ZDC_VIDEO_ENCODER` names
-/// ([`named_element`]), else software.
+/// backend that isn't built in or doesn't work is an error; `Auto` and `Software` fall back to the element
+/// `ZDC_VIDEO_ENCODER` names ([`named_element`]), else zenoh-gateway's own.
 pub fn select(backend: Backend) -> Result<Selected> {
     let software = || Selected { name: "software".into(), factory: None, hardware: None };
     let candidates: &[Backend] = match backend {
-        Backend::Software => return Ok(software()),
+        // `Software` means "no hardware encoder", which is exactly when naming one matters: it is the choice between
+        // openh264 and whatever else is installed. Asking for an element and being given openh264 without a word
+        // (which is what a host passing `Software` used to get) is the worst of the three outcomes.
+        Backend::Software => &[],
         Backend::Auto => &[Backend::VideoToolbox, Backend::Gstreamer],
         Backend::VideoToolbox => &[Backend::VideoToolbox],
         Backend::Gstreamer => &[Backend::Gstreamer],
@@ -114,19 +123,20 @@ pub fn select(backend: Backend) -> Result<Selected> {
             Err(error) => failures.push(format!("{error:#}")),
         }
     }
-    if backend == Backend::Auto {
+    if backend == Backend::Auto || backend == Backend::Software {
         // an element asked for by name: on a machine with no hardware encoder this is the only way past openh264
         #[cfg(feature = "gstreamer")]
         if let Some(name) = named_element() {
             match probe_element(&name) {
                 Ok(selected) => {
-                    log::info!("no hardware video encoder ({}): {} as ZDC_VIDEO_ENCODER asks", failures.join("; "), selected.name);
+                    log::info!("video encoder: {} as ZDC_VIDEO_ENCODER asks{}", selected.name, hardware_note(&failures));
                     return Ok(selected);
                 }
-                Err(error) => failures.push(format!("ZDC_VIDEO_ENCODER={name}: {error:#}")),
+                // loudly: someone naming an encoder meant it, and silently encoding with another is how an hour goes
+                Err(error) => log::warn!("ZDC_VIDEO_ENCODER={name} cannot encode ({error:#}): software H.264 instead"),
             }
         }
-        log::info!("no hardware video encoder ({}): software H.264", failures.join("; "));
+        log::info!("video encoder: software H.264{}", hardware_note(&failures));
         return Ok(software());
     }
     bail!("{}", failures.join("; "))

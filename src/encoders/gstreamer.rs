@@ -455,8 +455,13 @@ impl Pipeline {
             // which landed and which did not, rather than leaving it to be inferred from the frame rate.
             let mut applied = Vec::new();
             let mut missing = Vec::new();
-            for (name, value) in element.settings {
-                if pipeline.set(name, value) { applied.push(format!("{name}={value}")) } else { missing.push(*name) }
+            // Pinning confines a pipeline to one core, and every thread it makes inherits that - so an encoder that
+            // threads its work has all of it on that core, which is slower than not pinning at all (measured: x264enc
+            // had two threads, and both on one core held a 0.4 ms encode at 15-25 ms, shrinking the picture with it).
+            // The two settings are only correct together, so asking for one asks for the other.
+            let threads = super::pin::pinning().then_some(("threads", "1"));
+            for (name, value) in element.settings.iter().copied().chain(threads) {
+                if pipeline.set(name, value) { applied.push(format!("{name}={value}")) } else { missing.push(name) }
             }
             // the bitrate too: it comes from the allocator's grant, not this table, and a tiny one explains a small
             // picture on its own - the policy shrinks to hold its bits per pixel - without the encoder being at fault
@@ -464,6 +469,9 @@ impl Pipeline {
             log::info!("GStreamer {}: {}", element.name, applied.join(" "));
             if !missing.is_empty() {
                 log::warn!("GStreamer {}: no property {} - it keeps its default there, which for an encoder is usually much slower", element.name, missing.join(", "));
+            }
+            if super::pin::pinning() && missing.contains(&"threads") {
+                log::warn!("GStreamer {}: pinned but it has no `threads` property, so its own threading is whatever it chooses - watch the encode stage", element.name);
             }
             let interval = ((fps * super::KEYFRAME_SECONDS).ceil() as u32).max(1).to_string();
             for name in element.keyframe_interval {
@@ -946,6 +954,10 @@ impl H265Decoder {
     /// day was lost once already.
     fn description(element: &str, parse: bool, ends: &(String, String)) -> String {
         let parser = if parse { " h265parse !" } else { "" };
+        // as the encoder does: pinning confines every thread this makes to one core, so it gets one worker unless the
+        // element was asked for with its own threading. libav's own default is a worker per core, and sixteen of them
+        // on the one core a pin gives is slower than not pinning
+        let element = &if super::pin::pinning() && !element.contains("threads") { format!("{element} max-threads=1") } else { element.to_owned() };
         format!(
             "appsrc name={} is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 !{parser} {element} ! videoconvert ! video/x-raw,format=I420 ! appsink name={} sync=false",
             ends.0, ends.1

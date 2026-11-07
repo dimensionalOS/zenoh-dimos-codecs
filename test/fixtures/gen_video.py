@@ -70,3 +70,7 @@ idr = next(at for at in range(len(h265) - 4) if h265[at:at + 3] == b"\0\0\1" and
 
 # (generate.py folds it into manifest.json; the ROS 2 fixture has no RIHS01 key, so only its parser is tested)
 (HERE / "manifest.video.json").write_text(json.dumps(entries, indent=2) + "\n")
+
+import gen_video_stream  # noqa: E402
+
+gen_video_stream.main()

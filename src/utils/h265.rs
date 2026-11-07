@@ -13,6 +13,10 @@ type Context_ = *mut c_void;
 type Image = *const c_void;
 
 const DE265_OK: c_int = 0;
+const DE265_ERROR_WAITING_FOR_INPUT_DATA: c_int = 13;
+/// the warnings that say nothing about the picture (threading, SEI, the warning queue itself); every other one means it
+/// decoded damaged (libde265 conceals corrupt slices and missing references, warning instead of failing)
+const DE265_HARMLESS_WARNINGS: [c_int; 5] = [1000, 1001, 1022, 1025, 1036];
 const DE265_CHROMA_MONO: c_int = 0;
 const DE265_CHROMA_420: c_int = 1;
 
@@ -22,6 +26,8 @@ struct Api {
     free_decoder: unsafe extern "C" fn(Context_) -> c_int,
     push_data: unsafe extern "C" fn(Context_, *const c_void, c_int, i64, *mut c_void) -> c_int,
     flush_data: unsafe extern "C" fn(Context_) -> c_int,
+    push_end_of_frame: unsafe extern "C" fn(Context_),
+    get_warning: unsafe extern "C" fn(Context_) -> c_int,
     decode: unsafe extern "C" fn(Context_, *mut c_int) -> c_int,
     get_next_picture: unsafe extern "C" fn(Context_) -> Image,
     get_image_width: unsafe extern "C" fn(Image, c_int) -> c_int,
@@ -55,6 +61,8 @@ impl Api {
                 free_decoder: symbol!("de265_free_decoder"),
                 push_data: symbol!("de265_push_data"),
                 flush_data: symbol!("de265_flush_data"),
+                push_end_of_frame: symbol!("de265_push_end_of_frame"),
+                get_warning: symbol!("de265_get_warning"),
                 decode: symbol!("de265_decode"),
                 get_next_picture: symbol!("de265_get_next_picture"),
                 get_image_width: symbol!("de265_get_image_width"),
@@ -90,6 +98,75 @@ impl Drop for Decoder<'_> {
     fn drop(&mut self) {
         // SAFETY: the context came from de265_new_decoder and is freed once
         unsafe { (self.api.free_decoder)(self.context) };
+    }
+}
+
+/// A decoder for a stream of access units, each decoded with the state the ones before it left.
+pub struct Stream {
+    decoder: Decoder<'static>,
+}
+
+// SAFETY: the context is used by one thread at a time (`feed` takes `&mut self`), and libde265 keeps no thread-local state
+unsafe impl Send for Stream {}
+
+impl Stream {
+    pub fn new() -> Result<Stream> {
+        let api = api()?;
+        // SAFETY: a fresh context, freed by the guard
+        let decoder = Decoder { api, context: unsafe { (api.new_decoder)() } };
+        anyhow::ensure!(!decoder.context.is_null(), "libde265 made no decoder");
+        Ok(Stream { decoder })
+    }
+
+    /// Decodes the next access unit: the newest picture it finished, if any. Fails on a decoding error, and on a picture
+    /// libde265 warns it decoded damaged (it would show garbage until the next keyframe).
+    pub fn feed(&mut self, data: &[u8]) -> Result<Option<VideoImage>> {
+        let (api, context) = (self.decoder.api, self.decoder.context);
+        let length = c_int::try_from(data.len()).context("H.265 access unit over 2 GB")?;
+        // SAFETY: libde265 copies the pushed bytes; `data` outlives the call. The access unit ends here, so its last NAL
+        // decodes now rather than when the next sample's start code arrives.
+        let pushed = unsafe { (api.push_data)(context, data.as_ptr().cast(), length, 0, std::ptr::null_mut()) };
+        if pushed != DE265_OK {
+            bail!("libde265: {}", api.error_text(pushed));
+        }
+        // SAFETY: as above
+        unsafe { (api.push_end_of_frame)(context) };
+        let mut newest = None;
+        loop {
+            let mut more: c_int = 0;
+            // SAFETY: as above; `more` is a valid out pointer
+            let error = unsafe { (api.decode)(context, &mut more) };
+            // SAFETY: each picture is copied before any other libde265 call
+            loop {
+                let picture = unsafe { (api.get_next_picture)(context) };
+                if picture.is_null() {
+                    break;
+                }
+                newest = Some(copy_picture(api, picture)?);
+            }
+            if error == DE265_ERROR_WAITING_FOR_INPUT_DATA || more == 0 {
+                break;
+            }
+            // SAFETY: de265_isOK takes any code
+            if unsafe { (api.is_ok)(error) } == 0 {
+                bail!("libde265: {}", api.error_text(error));
+            }
+        }
+        let mut damage = None;
+        loop {
+            // SAFETY: as above
+            let warning = unsafe { (api.get_warning)(context) };
+            if warning == DE265_OK {
+                break;
+            }
+            if !DE265_HARMLESS_WARNINGS.contains(&warning) {
+                damage.get_or_insert(warning);
+            }
+        }
+        if let Some(warning) = damage {
+            bail!("libde265: {} (a corrupt or lost sample)", api.error_text(warning));
+        }
+        Ok(newest)
     }
 }
 
@@ -150,7 +227,7 @@ fn copy_picture(api: &Api, picture: Image) -> Result<VideoImage> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::utils::tests::fixture;
 

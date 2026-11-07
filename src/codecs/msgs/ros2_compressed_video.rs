@@ -1,5 +1,5 @@
-//! `foxglove_msgs/CompressedVideo` from ROS 2 (rmw_zenoh, CDR) as video: an H.264 or H.265 keyframe (Annex-B, with its
-//! parameter sets) to a picture for the video encoder.
+//! `foxglove_msgs/CompressedVideo` from ROS 2 (rmw_zenoh, CDR) as video: H.264 or H.265 access units (Annex-B), decoded
+//! in order from the first keyframe on, to pictures for the video encoder.
 
 use super::CompressedVideo;
 use crate::utils::{cdr::Cdr, compressed_video};
@@ -36,6 +36,15 @@ impl MessageEncoding for Ros2CompressedVideo {
     fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
         let message = parse(sample.payload)?;
         Ok(DecodedFrame::Video(message.header.add_to_video(compressed_video::to_video(message.data, &message.format)?)))
+    }
+
+    /// a decoder per key, fed every access unit in order: predicted frames play, from the first keyframe on
+    fn stream_decoder(&self) -> Option<Box<dyn zenoh_gateway::StreamDecoder>> {
+        Some(Box::new(super::CompressedVideoStream::new(parse)))
+    }
+
+    fn starts_stream(&self, sample: &EncodingSample<'_>) -> bool {
+        super::CompressedVideoStream::starts(parse, sample.payload)
     }
 }
 

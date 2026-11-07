@@ -6,14 +6,31 @@ use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use zenoh_gateway::VideoImage;
 
+/// A decoder for a stream of access units, each decoded with the state the ones before it left.
+pub struct Stream {
+    decoder: Decoder,
+}
+
+impl Stream {
+    pub fn new() -> Result<Stream> {
+        Ok(Stream { decoder: Decoder::new().context("openh264 decoder")? })
+    }
+
+    /// Decodes the next access unit: its picture, if it finished one. Fails on a decoding error (a lost reference too).
+    pub fn feed(&mut self, data: &[u8]) -> Result<Option<VideoImage>> {
+        self.decoder.decode(data).context("openh264")?.map(|yuv| to_image(&yuv)).transpose()
+    }
+}
+
+fn to_image(yuv: &dyn YUVSource) -> Result<VideoImage> {
+    let ((width, height), (y_stride, u_stride, v_stride)) = (yuv.dimensions(), yuv.strides());
+    i420_from_planes(width, height, [(yuv.y(), y_stride), (yuv.u(), u_stride), (yuv.v(), v_stride)])
+}
+
 /// The first picture in an Annex-B access unit (with its parameter sets), as I420.
 pub fn decode(data: &[u8]) -> Result<VideoImage> {
     let mut decoder = Decoder::new().context("openh264 decoder")?;
     let picture = decoder.decode(data).context("openh264")?;
-    let to_image = |yuv: &dyn YUVSource| {
-        let ((width, height), (y_stride, u_stride, v_stride)) = (yuv.dimensions(), yuv.strides());
-        i420_from_planes(width, height, [(yuv.y(), y_stride), (yuv.u(), u_stride), (yuv.v(), v_stride)])
-    };
     if let Some(yuv) = picture {
         return to_image(&yuv);
     }

@@ -104,6 +104,33 @@ pub struct CompressedVideo<'a> {
     pub format: String,
 }
 
+/// A `CompressedVideo` message type's stream decoder: its key's access units in order (zenoh-gateway's stream decoding),
+/// each picture with its message's header.
+pub struct CompressedVideoStream {
+    parse: for<'a> fn(&'a [u8]) -> anyhow::Result<CompressedVideo<'a>>,
+    pictures: crate::utils::compressed_video::Pictures,
+}
+
+impl CompressedVideoStream {
+    pub fn new(parse: for<'a> fn(&'a [u8]) -> anyhow::Result<CompressedVideo<'a>>) -> Self {
+        CompressedVideoStream { parse, pictures: Default::default() }
+    }
+
+    /// Whether decoding can start at this message: it parses and holds a keyframe.
+    pub fn starts(parse: for<'a> fn(&'a [u8]) -> anyhow::Result<CompressedVideo<'a>>, payload: &[u8]) -> bool {
+        use crate::utils::compressed_video::{Codec, is_keyframe};
+        parse(payload).is_ok_and(|message| Codec::from_format(&message.format).is_ok_and(|codec| is_keyframe(codec, message.data)))
+    }
+}
+
+impl zenoh_gateway::StreamDecoder for CompressedVideoStream {
+    fn feed(&mut self, sample: &zenoh_gateway::EncodingSample<'_>, _channel: zenoh_gateway::Channel) -> anyhow::Result<Option<zenoh_gateway::DecodedFrame>> {
+        let message = (self.parse)(sample.payload)?;
+        let picture = self.pictures.feed(message.data, &message.format)?;
+        Ok(picture.map(|picture| zenoh_gateway::DecodedFrame::Video(message.header.add_to_video(picture))))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointField {
     pub name: String,

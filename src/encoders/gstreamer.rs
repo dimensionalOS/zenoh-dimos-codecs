@@ -181,12 +181,22 @@ impl Element {
     /// SPS and PPS before each keyframe itself when its output is byte-stream (checked: `9,7,8,5,5,5` at every
     /// keyframe), and `nvv4l2h264enc` has `insert-sps-pps=true` among its settings for the same reason.
     fn output_chain(&self, api: &Api) -> String {
-        let profile = if self.profile.is_empty() { String::new() } else { format!("profile={},", self.profile) };
-        if has_element(api, "h264parse") {
-            let filter = if self.profile.is_empty() { String::new() } else { format!(" video/x-h264,{profile} !") };
+        self.output_chain_with(has_element(api, "h264parse"))
+    }
+
+    /// [`output_chain`](Self::output_chain) for a machine that has `h264parse` or not, so both shapes can be checked
+    /// without installing GStreamer's parsers. They are checked because they differed by a comma and the wrong one
+    /// could not be parsed at all: the profile carries a **leading** comma, which is right whether a field follows it
+    /// or the caps end there. It used to carry a trailing one, correct only in the branch without the parser — which is
+    /// the branch a machine without `gstreamer1.0-plugins-bad` takes, so every test passed while the robot, which has
+    /// the parser, could not build the pipeline and silently encoded with openh264 instead.
+    fn output_chain_with(&self, parser: bool) -> String {
+        let profile = if self.profile.is_empty() { String::new() } else { format!(",profile={}", self.profile) };
+        if parser {
+            let filter = if profile.is_empty() { String::new() } else { format!(" video/x-h264{profile} !") };
             format!("{filter} h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au !")
         } else {
-            format!(" video/x-h264,{profile}stream-format=byte-stream,alignment=au !")
+            format!(" video/x-h264{profile},stream-format=byte-stream,alignment=au !")
         }
     }
 }
@@ -829,5 +839,30 @@ mod tests {
         assert_eq!(&*gstreamer_layout(&packed, (6, 2)), &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0, 13, 14, 15, 0, 16, 17, 18, 0]);
         let aligned = vec![0u8; 16 * 2 * 3 / 2];
         assert!(matches!(gstreamer_layout(&aligned, (16, 2)), Cow::Borrowed(_)), "a width that is a multiple of 8 is already laid out");
+    }
+
+    /// Caps GStreamer cannot parse are a pipeline that cannot be built, and the encoder then falls back silently.
+    /// `profile=constrained-baseline,` with nothing after it is exactly that, and it only appeared in the branch
+    /// taken by a machine that has `h264parse` - so no test on a machine without it could see it.
+    #[test]
+    fn the_output_chain_is_well_formed_with_and_without_the_parser() {
+        let profiled = Element { profile: H264_SDP_PROFILE, name: "x264enc", upload: "", kbps: true, settings: &[], keyframe_interval: &[], min_size: (0, 0) };
+        let plain = Element { profile: "", ..profiled };
+        for element in [&profiled, &plain] {
+            for parser in [true, false] {
+                let chain = element.output_chain_with(parser);
+                // a field name and a value on either side of every comma: no empty fields, however the parts combine
+                for caps in chain.split('!').map(str::trim).filter(|part| part.starts_with("video/x-h264")) {
+                    for field in caps.trim_start_matches("video/x-h264").split(',').skip(1) {
+                        assert!(field.contains('='), "empty or valueless caps field {field:?} in {chain:?}");
+                    }
+                }
+                assert!(!chain.contains(",,") && !chain.contains(", "), "malformed caps in {chain:?}");
+                assert_eq!(chain.contains("h264parse"), parser, "{chain:?}");
+                assert_eq!(chain.contains(H264_SDP_PROFILE), !element.profile.is_empty(), "{chain:?}");
+                // whatever the shape, the appsink is handed byte-stream access units
+                assert!(chain.contains("stream-format=byte-stream,alignment=au"), "{chain:?}");
+            }
+        }
     }
 }

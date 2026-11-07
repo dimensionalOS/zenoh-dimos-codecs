@@ -92,9 +92,20 @@ impl Backend {
 
     fn resync(&mut self) {
         match self {
+            // its pipeline is kept: a keyframe clears the reference pictures by itself, and rebuilding on every lost
+            // sample is ~35 ms of stall each on a decoder that was working
             #[cfg(feature = "gstreamer")]
-            Backend::Gstreamer(decoder) => decoder.reset(),
+            Backend::Gstreamer(decoder) => decoder.resync(),
             Backend::Libde265(stream) => stream.resync(),
+        }
+    }
+
+    /// Pipelines the decoder has built (0 where there is no pipeline to build).
+    fn pipelines_made(&self) -> u64 {
+        match self {
+            #[cfg(feature = "gstreamer")]
+            Backend::Gstreamer(decoder) => decoder.pipelines_made(),
+            Backend::Libde265(_) => 0,
         }
     }
 
@@ -139,6 +150,13 @@ impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
     pub fn new(parse: Parse) -> Self {
         CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None }
+    }
+
+    /// Decoder pipelines this stream has built, where its decoder builds one (GStreamer): **one** for a stream, for
+    /// its life. A lost sample does not need another — a keyframe clears the reference pictures by itself — and one
+    /// per lost sample cost ~35 ms of stall each on a decoder that was working.
+    pub fn pipelines_made(&self) -> u64 {
+        self.h265.as_ref().map_or(0, Backend::pipelines_made)
     }
 
     /// How many samples the decoder may hold before it waits for a picture, over what the decoder picks for itself.
@@ -401,6 +419,42 @@ mod tests {
             }
         }
         assert!(held > 0, "every picture came out of the call that fed it: the decoder is waiting for each one, which is the ~22 fps ceiling");
+    }
+
+    /// A lost sample must not cost a new decoder. Rebuilding the GStreamer pipeline on every resync stalls the loop
+    /// ~35 ms each time, and a stream that loses a sample every few seconds pays it again and again — on a decoder
+    /// that was working. A keyframe is all a gap needs: an IRAP picture clears the reference pictures by itself.
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn a_lost_sample_does_not_build_a_new_decoder() {
+        if crate::encoders::gstreamer::H265Decoder::new().is_err() {
+            eprintln!("skipping: no GStreamer H.265 decoder");
+            return;
+        }
+        // SAFETY: single-threaded test, and the variable is read only when a backend is made
+        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
+        let (keyframe, predicted) = capture();
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        decoder.hold(0);
+        // this stream's own count, not the process-wide one: other tests in this binary have decoders of their own
+        let before = decoder.pipelines_made();
+        assert!(feed(&mut decoder, &keyframe, "h265", 0, 1_000).unwrap().is_some(), "the keyframe decodes");
+        for (index, unit) in predicted.iter().take(3).enumerate() {
+            feed(&mut decoder, unit, "h265", index as u64 + 1, 1_001 + index as i32).unwrap();
+        }
+        let started = decoder.pipelines_made();
+        assert_eq!((before, started), (0, 1), "one stream, one pipeline");
+        // three samples lost, three times over: each is a resync
+        for round in 0..3 {
+            decoder.resync();
+            // nothing until the keyframe, as before
+            assert!(feed(&mut decoder, &predicted[4], "h265", 10 + round, 2_000).unwrap().is_none(), "a predicted frame after a gap shows nothing");
+            assert!(feed(&mut decoder, &keyframe, "h265", 11 + round, 2_001).unwrap().is_some(), "the next keyframe makes it whole again");
+        }
+        assert_eq!(decoder.pipelines_made(), started, "three resyncs, still the one pipeline");
+        // and it is still decoding predicted frames off that keyframe
+        let pictures = predicted.iter().take(5).enumerate().filter(|(index, unit)| feed(&mut decoder, unit, "h265", 20 + *index as u64, 3_000).unwrap().is_some()).count();
+        assert_eq!(pictures, 5, "the stream carries on after the resyncs");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use zenoh_gateway::{DecodedFrame, EncodedVideo, VideoEncoder, VideoFormat, VideoTarget};
 
@@ -721,6 +722,16 @@ const DEFAULT_H265_DECODER: &str = "avdec_h265";
 /// error; add it.
 const PARSED_INPUT_DECODERS: &[&str] = &["mppvideodec", "v4l2h265dec", "nvv4l2decoder", "vah265dec", "vaapih265dec"];
 
+/// Decoder pipelines alive now, and how many have ever been made: whether a resync leaves the old pipeline behind is
+/// a question a thread count cannot answer (libav names its worker threads after the thread that spawned them, so one
+/// pipeline shows one `source:src` thread per core), so the decoder says so itself.
+static PIPELINES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// (live, ever made) decoder pipelines. One per stream is right; one more per resync was the shape of a bug.
+pub fn decoder_pipelines() -> (u64, u64) {
+    (PIPELINES.0.load(Ordering::Relaxed), PIPELINES.1.load(Ordering::Relaxed))
+}
+
 /// H.265 decoded by GStreamer, keeping its state between access units so predicted frames decode.
 ///
 /// [`h265::Stream`](crate::utils::h265::Stream) does the same job with libde265, which is the fallback where GStreamer
@@ -733,7 +744,10 @@ const PARSED_INPUT_DECODERS: &[&str] = &["mppvideodec", "v4l2h265dec", "nvv4l2de
 /// `alignment=nal` is refused by the decoder.
 pub struct H265Decoder {
     api: &'static Api,
+    /// the element with any properties, as it goes into the pipeline
     element: String,
+    /// just the factory, for the messages and for `PARSED_INPUT_DECODERS`
+    factory: String,
     /// (pipeline, appsrc, appsink); made on the first access unit, since the pipeline is not size-specific
     pipeline: Option<(Pointer, Pointer, Pointer)>,
     /// the frame ids of the units inside, oldest first: pictures come out in the order the units went in, one per unit
@@ -744,6 +758,10 @@ pub struct H265Decoder {
     inside: VecDeque<u64>,
     /// how many units may be inside before `decode` waits for a picture ([`frames_inside`])
     inside_max: u64,
+    /// samples were lost: nothing goes in until a keyframe, which is what makes the picture whole again
+    after_gap: bool,
+    /// pipelines this decoder has built: one is right, and one per lost sample was the shape of a bug
+    made: u64,
 }
 
 // SAFETY: GStreamer objects are thread-safe; the decoder uses them one call at a time (`&mut self`)
@@ -760,18 +778,28 @@ impl H265Decoder {
     pub fn new() -> Result<Self> {
         let api = api()?;
         let element = std::env::var("ZDC_H265_GST_DECODER").unwrap_or_else(|_| DEFAULT_H265_DECODER.to_owned());
+        // the first word is the factory; what follows is properties for it (`ZDC_H265_GST_DECODER="avdec_h265
+        // thread-type=slice"`), which go into the pipeline as they are — so a decoder's threading can be tried on a
+        // robot without a build
+        let factory_name = element.split_whitespace().next().unwrap_or_default().to_owned();
         // SAFETY: the factory reference is released at once
         unsafe {
-            let factory = (api.element_factory_find)(c_string(&element).as_ptr());
-            ensure!(!factory.is_null(), "GStreamer has no {element}");
+            let factory = (api.element_factory_find)(c_string(&factory_name).as_ptr());
+            ensure!(!factory.is_null(), "GStreamer has no {factory_name}");
             (api.object_unref)(factory);
         }
-        Ok(H265Decoder { api, element, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside() })
+        Ok(H265Decoder { api, element, factory: factory_name, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside(), after_gap: false, made: 0 })
     }
 
     /// The element in use, e.g. `"avdec_h265"`.
     pub fn element(&self) -> &str {
         &self.element
+    }
+
+    /// Pipelines **this** decoder has built. One is right: a lost sample is not a reason to build another, and a
+    /// count that climbs with [`resync`](Self::resync) is the ~35 ms-per-gap stall coming back.
+    pub fn pipelines_made(&self) -> u64 {
+        self.made
     }
 
     /// How many access units may be inside before [`decode`](Self::decode) waits for a picture, over
@@ -790,15 +818,30 @@ impl H265Decoder {
                     (self.api.object_unref)(object);
                 }
             }
+            let live = PIPELINES.0.fetch_sub(1, Ordering::Relaxed) - 1;
+            log::info!("H.265 decoder pipeline stopped: {live} live, {} made", PIPELINES.1.load(Ordering::Relaxed));
         }
+        // the units inside went with the pipeline
+        self.inside.clear();
     }
 
-    /// Throws the decoder away, so the next access unit starts a new one. What a stream does after losing samples: a
-    /// new pipeline has no reference pictures, so it shows nothing until a keyframe, which is what is wanted.
+    /// Throws the pipeline away, so the next access unit starts a new one. For a stream the decoder could not follow
+    /// (a bus error): everything after it may be built on what went wrong.
+    ///
+    /// **Not what a lost sample needs** — that is [`resync`](Self::resync), which keeps the pipeline. Rebuilding on
+    /// every lost sample cost ~35 ms of stall each, and a stream that loses one sample every few seconds spends that
+    /// again and again on a decoder that was working.
     pub fn reset(&mut self) {
         self.stop();
-        // the pictures inside went with the pipeline
-        self.inside.clear();
+    }
+
+    /// Samples were lost: show nothing until the next keyframe, **keeping this pipeline**.
+    ///
+    /// A keyframe is enough on its own — an IRAP picture clears the decoder's reference pictures by definition, which
+    /// is the whole of what a new pipeline would have given. The units already pushed are left inside: their pictures
+    /// were decoded from samples that did arrive, they still come out in order, and the frame ids keep them paired.
+    pub fn resync(&mut self) {
+        self.after_gap = true;
     }
 
     /// The pipeline for `element`, with `h265parse` in front of it or without.
@@ -825,7 +868,7 @@ impl H265Decoder {
     /// waits [`OUTPUT_TIMEOUT`] for that nothing — seconds, per frame, for as long as the keyframes are missed. That
     /// turns a stream that should drop a second of pictures after a loss into one that delivers almost none.
     pub fn needs_keyframe(&self) -> bool {
-        self.pipeline.is_none()
+        self.pipeline.is_none() || self.after_gap
     }
 
     /// Feeds one Annex-B access unit, which follows every unit fed before it, and takes the oldest picture out as
@@ -837,14 +880,20 @@ impl H265Decoder {
     /// ([`h265_sps::picture_size`](crate::utils::h265_sps::picture_size)) — cheaper and more direct than reading the
     /// sink's negotiated caps back out of GStreamer, and `packed_i420` fails loudly if the decoder disagrees.
     pub fn decode(&mut self, access_unit: &[u8], size: (u32, u32), frame_id: u64) -> Result<Option<(Vec<u8>, u64)>> {
+        // a keyframe is what a gap was waiting for: from here the pictures are whole again
+        self.after_gap = false;
         if self.pipeline.is_none() {
-            let parse = PARSED_INPUT_DECODERS.contains(&self.element.as_str());
+            let parse = PARSED_INPUT_DECODERS.contains(&self.factory.as_str());
             if parse {
-                ensure!(has_element(self.api, "h265parse"), "{} needs h265parse in front of it (gstreamer1.0-plugins-bad), which GStreamer here does not have", self.element);
+                ensure!(has_element(self.api, "h265parse"), "{} needs h265parse in front of it (gstreamer1.0-plugins-bad), which GStreamer here does not have", self.factory);
             }
             let description = Self::description(&self.element, parse);
             let (pipeline, source, sink) = launch(self.api, &description)?;
             self.pipeline = Some((pipeline, source, sink));
+            self.made += 1;
+            let (live, made) = (PIPELINES.0.fetch_add(1, Ordering::Relaxed) + 1, PIPELINES.1.fetch_add(1, Ordering::Relaxed) + 1);
+            // one per stream is right; one per resync is the bug this count exists to show
+            log::info!("H.265 decoder pipeline started ({}): {live} live, {made} made", self.element);
         }
         let (pipeline, source, sink) = self.pipeline.expect("made above");
         push(self.api, source, access_unit)?;

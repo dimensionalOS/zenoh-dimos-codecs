@@ -136,6 +136,12 @@ pub fn select(backend: Backend) -> Result<Selected> {
                 Err(error) => log::warn!("ZDC_VIDEO_ENCODER={name} cannot encode ({error:#}): software H.264 instead"),
             }
         }
+        // a build without the `gstreamer` feature cannot make the element asked for; saying so beats encoding with
+        // another and leaving someone to wonder why the one they named made no difference
+        #[cfg(not(feature = "gstreamer"))]
+        if let Some(name) = named_element() {
+            log::warn!("ZDC_VIDEO_ENCODER={name} needs this crate's `gstreamer` feature, which this build does not have: software H.264 instead");
+        }
         log::info!("video encoder: software H.264{}", hardware_note(&failures));
         return Ok(software());
     }

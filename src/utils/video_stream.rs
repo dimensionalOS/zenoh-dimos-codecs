@@ -14,8 +14,9 @@
 
 use super::compressed_video::{self, Codec};
 use super::h265;
-use crate::codecs::msgs::CompressedVideo;
+use crate::codecs::msgs::{CompressedVideo, Header};
 use anyhow::{Context, Result, bail};
+use std::collections::VecDeque;
 use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoImage};
 
 /// How a compressed-video encoding reads its own wire format (`ros2_compressed_video`'s CDR,
@@ -42,27 +43,29 @@ impl Backend {
         // every branch below says which decoder it picked and why. The two differ by nearly twice in speed (~83 fps of
         // 720p against ~50 on an RK3588 core), and a stale `ZDC_H265_BACKEND` in some unit file quietly costing that
         // much is exactly the kind of thing that gets blamed on the hardware for an afternoon.
-        let mut why = String::new();
         #[cfg(feature = "gstreamer")]
-        if forced == "libde265" {
-            why = " (ZDC_H265_BACKEND asks for it; GStreamer's is faster where it is installed)".to_owned();
+        let why = if forced == "libde265" {
+            " (ZDC_H265_BACKEND asks for it; GStreamer's is faster where it is installed)".to_owned()
         } else {
             match crate::encoders::gstreamer::H265Decoder::new() {
                 Ok(decoder) => {
                     log::info!("H.265 stream decoding with GStreamer {}", decoder.element());
                     return Ok(Backend::Gstreamer(decoder));
                 }
-                Err(error) => why = format!(" (no GStreamer H.265 decoder: {error:#})"),
+                Err(error) => format!(" (no GStreamer H.265 decoder: {error:#})"),
             }
-        }
+        };
+        #[cfg(not(feature = "gstreamer"))]
+        let why = String::new();
         let _ = &forced;
         let stream = h265::Stream::new().context("no H.265 decoder: neither a GStreamer one nor libde265")?;
         log::info!("H.265 stream decoding with libde265{why}");
         Ok(Backend::Libde265(stream))
     }
 
-    /// One access unit in, the picture it completed out. `keyframe`: it is decodable on its own.
-    fn decode(&mut self, access_unit: &[u8], keyframe: bool, size: Option<(u32, u32)>) -> Result<Option<VideoImage>> {
+    /// One access unit in, a picture out with the `frame_id` of the unit it came from — which is an earlier unit's for
+    /// a decoder that holds frames. `keyframe`: the unit is decodable on its own.
+    fn decode(&mut self, access_unit: &[u8], keyframe: bool, size: Option<(u32, u32)>, frame_id: u64) -> Result<Option<(VideoImage, u64)>> {
         match self {
             #[cfg(feature = "gstreamer")]
             Backend::Gstreamer(decoder) => {
@@ -75,13 +78,14 @@ impl Backend {
                 if decoder.needs_keyframe() && !keyframe {
                     return Ok(None);
                 }
-                let Some(data) = decoder.decode(access_unit, size)? else { return Ok(None) };
-                VideoImage::i420(size.0, size.1, data).map(Some)
+                let Some((data, frame_id)) = decoder.decode(access_unit, size, frame_id)? else { return Ok(None) };
+                VideoImage::i420(size.0, size.1, data).map(|picture| Some((picture, frame_id)))
             }
-            // libde265 reports its own picture size, so it has no use for `size` (which only GStreamer needs told)
+            // libde265 reports its own picture size, so it has no use for `size` (which only GStreamer needs told), and
+            // it holds no frames: the picture it gives is the unit just pushed
             Backend::Libde265(stream) => {
                 let _ = size;
-                stream.push(access_unit, keyframe)
+                Ok(stream.push(access_unit, keyframe)?.map(|picture| (picture, frame_id)))
             }
         }
     }
@@ -92,6 +96,16 @@ impl Backend {
             Backend::Gstreamer(decoder) => decoder.reset(),
             Backend::Libde265(stream) => stream.resync(),
         }
+    }
+
+    /// How many access units may be inside before a `decode` waits for its picture. libde265 holds none either way.
+    fn hold(&mut self, frames: u64) {
+        match self {
+            #[cfg(feature = "gstreamer")]
+            Backend::Gstreamer(decoder) => decoder.hold(frames),
+            Backend::Libde265(_) => {}
+        }
+        let _ = frames;
     }
 }
 
@@ -107,17 +121,41 @@ pub struct CompressedVideoStream {
     parameter_sets: Option<Vec<u8>>,
     /// the newest size any sequence parameter set gave: the units between keyframes carry none
     size: Option<(u32, u32)>,
+    /// which sample the last picture came from, for the gateway to stamp it with ([`StreamDecoder::last_frame_id`])
+    last_frame_id: Option<u64>,
+    /// the headers of the samples given to the decoder, oldest first, with the number each was given: a decoder that
+    /// holds a frame gives back an earlier sample's picture, and that picture's `stamp` and `frameId` — which the page
+    /// reads to know when and where the picture was taken — are that sample's, not the one just pushed in
+    headers: VecDeque<(u64, Header)>,
+    /// how many samples the decoder may hold, to set on it once it is made ([`CompressedVideoStream::hold`])
+    hold: Option<u64>,
 }
+
+/// Headers kept waiting for their picture. The decoder holds one frame, so two is the working depth; the rest is slack
+/// for a unit that completes no picture, whose header is dropped when a later one's picture comes out.
+const HEADERS_MAX: usize = 8;
 
 impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
     pub fn new(parse: Parse) -> Self {
-        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None }
+        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None }
+    }
+
+    /// How many samples the decoder may hold before it waits for a picture, over what the decoder picks for itself.
+    ///
+    /// `0` is one decode and one encode in series per frame, which is what capped a 720p stream at ~22 fps on the
+    /// robot — but also the only setting under which a sample's picture comes out of the same call that fed it, which
+    /// is what the tests of what a single sample means are written against.
+    pub fn hold(&mut self, frames: u64) {
+        self.hold = Some(frames);
+        if let Some(backend) = &mut self.h265 {
+            backend.hold(frames);
+        }
     }
 }
 
 impl StreamDecoder for CompressedVideoStream {
-    fn decode(&mut self, sample: &EncodingSample<'_>) -> Result<Option<DecodedFrame>> {
+    fn decode(&mut self, sample: &EncodingSample<'_>, frame_id: u64) -> Result<Option<DecodedFrame>> {
         let message = (self.parse)(sample.payload)?;
         match Codec::from_format(&message.format)? {
             Codec::H265 => {}
@@ -132,16 +170,41 @@ impl StreamDecoder for CompressedVideoStream {
         }
         let backend = match &mut self.h265 {
             Some(backend) => backend,
-            none => none.insert(Backend::best()?),
+            none => {
+                let mut made = Backend::best()?;
+                if let Some(frames) = self.hold {
+                    made.hold(frames);
+                }
+                none.insert(made)
+            }
         };
-        let picture = backend.decode(&data, keyframe, self.size)?;
-        Ok(picture.map(|picture| DecodedFrame::Video(message.header.add_to_video(picture))))
+        self.headers.push_back((frame_id, message.header.clone()));
+        while self.headers.len() > HEADERS_MAX {
+            self.headers.pop_front();
+        }
+        let Some((picture, picture_id)) = backend.decode(&data, keyframe, self.size, frame_id)? else { return Ok(None) };
+        self.last_frame_id = Some(picture_id);
+        // the samples before this picture's completed no picture of their own
+        while self.headers.front().is_some_and(|(id, _)| *id < picture_id) {
+            self.headers.pop_front();
+        }
+        // the picture's header is the header of the sample it came from, which for a decoder holding a frame is not the
+        // one just read (`every_picture_carries_the_header_of_its_own_sample`). The fallback is that sample's: it is
+        // only reached by a decoder that held pictures back past `HEADERS_MAX`, and a stamp a frame or two out beats none
+        let header = self.headers.front().filter(|(id, _)| *id == picture_id).map_or(&message.header, |(_, header)| header);
+        Ok(Some(DecodedFrame::Video(header.add_to_video(picture))))
+    }
+
+    fn last_frame_id(&self) -> Option<u64> {
+        self.last_frame_id
     }
 
     fn resync(&mut self) {
         if let Some(backend) = &mut self.h265 {
             backend.resync();
         }
+        // the samples whose pictures the decoder has thrown away: nothing will come out for them now
+        self.headers.clear();
         // the parameter sets are kept: they describe the stream, not the frames that were lost
     }
 }
@@ -153,8 +216,9 @@ mod tests {
     use crate::utils::compressed_video::{Codec, nal_units};
     use crate::utils::tests::fixture;
 
-    /// `foxglove_msgs/CompressedVideo` as CDR, so the decoder is fed what the gateway would feed it.
-    fn cdr(data: &[u8], format: &str) -> Vec<u8> {
+    /// `foxglove_msgs/CompressedVideo` as CDR, so the decoder is fed what the gateway would feed it. `sec` stamps its
+    /// header, so each sample can be told apart by the header its picture carries.
+    fn cdr_at(data: &[u8], format: &str, sec: i32) -> Vec<u8> {
         let mut body: Vec<u8> = Vec::with_capacity(data.len() + 64);
         let align = |body: &mut Vec<u8>| while body.len() % 4 != 0 { body.push(0) };
         let string = |body: &mut Vec<u8>, text: &str| {
@@ -163,7 +227,7 @@ mod tests {
             body.extend_from_slice(text.as_bytes());
             body.push(0);
         };
-        body.extend_from_slice(&1_700_000_000i32.to_le_bytes());
+        body.extend_from_slice(&sec.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
         string(&mut body, "camera_color_optical_frame");
         align(&mut body);
@@ -174,9 +238,14 @@ mod tests {
     }
 
     fn decode(decoder: &mut CompressedVideoStream, data: &[u8], format: &str) -> Result<Option<DecodedFrame>> {
-        let payload = cdr(data, format);
+        feed(decoder, data, format, 0, 1_700_000_000)
+    }
+
+    /// One sample in, numbered `frame_id` as the gateway numbers them, with `sec` as its header's stamp.
+    fn feed(decoder: &mut CompressedVideoStream, data: &[u8], format: &str, frame_id: u64, sec: i32) -> Result<Option<DecodedFrame>> {
+        let payload = cdr_at(data, format, sec);
         let encoding = zenoh_gateway::zenoh::bytes::Encoding::default();
-        decoder.decode(&EncodingSample::new("camera/front", &payload, &encoding))
+        decoder.decode(&EncodingSample::new("camera/front", &payload, &encoding), frame_id)
     }
 
     /// The access units of the robot's capture: its parameter sets are not in band, so only the keyframe fixture has
@@ -208,18 +277,25 @@ mod tests {
                 Backend::Gstreamer(decoder) => format!("gstreamer {}", decoder.element()),
                 Backend::Libde265(_) => "libde265".to_owned(),
             };
+            // every picture out of the call that fed it, so the count is exact and nothing overlaps the decode this
+            // measures (what the pictures cost is the point here; what holding one buys is
+            // `a_held_picture_comes_out_of_a_later_call`'s)
+            backend.hold(0);
             let mut sets = None;
             let unit = compressed_video::to_access_unit(&keyframe, "h265").unwrap();
             let (data, is_key) = compressed_video::decodable(&unit, &mut sets);
             let size = unit.size.expect("the keyframe carries an SPS");
             let started = std::time::Instant::now();
-            let first = backend.decode(&data, is_key, Some(size)).unwrap().expect("the keyframe decodes");
+            let (first, first_id) = backend.decode(&data, is_key, Some(size), 0).unwrap().expect("the keyframe decodes");
             assert_eq!((first.width(), first.height()), (1280, 720), "{name}");
+            assert_eq!(first_id, 0, "{name}: the picture is the sample it was given");
             let mut pictures = 1;
-            for unit in &predicted {
+            for (index, unit) in predicted.iter().enumerate() {
                 let unit = compressed_video::to_access_unit(unit, "h265").unwrap();
                 let (data, is_key) = compressed_video::decodable(&unit, &mut sets);
-                if backend.decode(&data, is_key, Some(size)).unwrap().is_some() {
+                let frame_id = index as u64 + 1;
+                if let Some((_, picture_id)) = backend.decode(&data, is_key, Some(size), frame_id).unwrap() {
+                    assert_eq!(picture_id, frame_id, "{name}: holding nothing, each picture is the sample just fed");
                     pictures += 1;
                 }
             }
@@ -241,6 +317,8 @@ mod tests {
         }
         let (keyframe, predicted) = capture();
         let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        // what one sample makes of itself, which is only visible while the decoder holds nothing back
+        decoder.hold(0);
         let first = decode(&mut decoder, &keyframe, "h265").unwrap().expect("the keyframe decodes");
         let DecodedFrame::Video(image) = first else { panic!("a picture") };
         assert_eq!((image.width(), image.height()), (1280, 720));
@@ -262,6 +340,7 @@ mod tests {
         }
         let (keyframe, predicted) = capture();
         let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        decoder.hold(0);
         // before any keyframe there is nothing to predict from
         assert!(decode(&mut decoder, &predicted[0], "h265").unwrap().is_none());
         assert!(decode(&mut decoder, &keyframe, "h265").unwrap().is_some());
@@ -270,6 +349,58 @@ mod tests {
         decoder.resync();
         assert!(decode(&mut decoder, &predicted[1], "h265").unwrap().is_none());
         assert!(decode(&mut decoder, &keyframe, "h265").unwrap().is_some());
+    }
+
+    /// The decoder holds a frame, so the picture a call hands over is an earlier sample's — and it has to come with
+    /// **that** sample's header, since `stamp` and `frameId` are how the page knows when and where a picture was taken.
+    /// Paired by position instead of by frame id, every picture of the stream would carry the next sample's stamp.
+    #[test]
+    fn every_picture_carries_the_header_of_its_own_sample() {
+        let (keyframe, predicted) = capture();
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut units = vec![keyframe];
+        units.extend(predicted.iter().take(9).cloned());
+        let mut pictures = Vec::new();
+        for (index, unit) in units.iter().enumerate() {
+            let frame_id = index as u64;
+            // each sample's header is stamped with its own number, so a picture says which sample it came from
+            let Ok(decoded) = feed(&mut decoder, unit, "h265", frame_id, 1_000 + frame_id as i32) else {
+                eprintln!("skipping: no H.265 decoder on this machine");
+                return;
+            };
+            let Some(DecodedFrame::Video(picture)) = decoded else { continue };
+            let header = picture.message_header().expect("the picture keeps its message's header");
+            pictures.push((decoder.last_frame_id().expect("a picture names its sample"), header.sec, frame_id));
+        }
+        assert!(pictures.len() + 1 >= units.len(), "{} pictures of {} samples", pictures.len(), units.len());
+        for (picture_id, sec, fed_id) in &pictures {
+            assert_eq!(*sec, 1_000 + *picture_id as i32, "the picture of sample {picture_id} carries sample {}'s header (it came out of sample {fed_id}'s call)", sec - 1_000);
+        }
+    }
+
+    /// Why the pairing above is not theoretical: with GStreamer the picture a call gives back is the sample before it,
+    /// which is what lets a picture decode while the gateway encodes the one before it.
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn a_held_picture_comes_out_of_a_later_call() {
+        if crate::encoders::gstreamer::H265Decoder::new().is_err() {
+            eprintln!("skipping: no GStreamer H.265 decoder");
+            return;
+        }
+        // SAFETY: the variable is read only when a backend is made, and this asks for the default one
+        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
+        let (keyframe, predicted) = capture();
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse);
+        let mut units = vec![keyframe];
+        units.extend(predicted.iter().take(4).cloned());
+        let mut held = 0;
+        for (index, unit) in units.iter().enumerate() {
+            let frame_id = index as u64;
+            if feed(&mut decoder, unit, "h265", frame_id, 1_000 + frame_id as i32).unwrap().is_some() && decoder.last_frame_id() != Some(frame_id) {
+                held += 1;
+            }
+        }
+        assert!(held > 0, "every picture came out of the call that fed it: the decoder is waiting for each one, which is the ~22 fps ceiling");
     }
 
     #[test]

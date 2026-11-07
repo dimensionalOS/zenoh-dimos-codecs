@@ -250,6 +250,24 @@ fn jpeg_in_flight() -> u64 {
     static IN_FLIGHT: OnceLock<u64> = OnceLock::new();
     *IN_FLIGHT.get_or_init(|| std::env::var("ZDC_GST_JPEG_IN_FLIGHT").ok().and_then(|value| value.parse().ok()).unwrap_or(6))
 }
+/// Access units inside the decoder before `decode` waits for a picture to come out.
+///
+/// One. Waiting for each unit's own picture puts the whole decode in the gateway's critical path, and the loop then runs
+/// at decode + encode a frame: 26 ms + ~12 ms on an RK3588 A76 core capped a 720p stream at ~22 fps while the CPU sat
+/// near idle — latency-bound, not CPU-bound. With one unit of slack a picture decodes while the gateway encodes the one
+/// before it, so the two stages overlap and the slower one sets the rate.
+///
+/// The picture that comes out is the one pushed before this, so it is one sample interval old — but it also finished
+/// decoding during that interval, so what this costs is `interval - decode`, not a whole interval: 33 - 26 = 7 ms at
+/// 30 Hz on that core, for 22 -> 30 fps. Where the decode is slower than the interval it costs nothing at all. That is
+/// also why it is one and not three: the gateway sends one picture per `decode` call, so deeper slack buys no more
+/// overlap and does add a whole interval each. `ZDC_H265_FRAMES_INSIDE=0` waits for every picture, as before — the
+/// serial behaviour, to measure against.
+const FRAMES_INSIDE: u64 = 1;
+
+fn frames_inside() -> u64 {
+    std::env::var("ZDC_H265_FRAMES_INSIDE").ok().and_then(|value| value.parse().ok()).unwrap_or(FRAMES_INSIDE)
+}
 /// How long that wait may last (the first frame's includes the pipeline's start); under zenoh-gateway's default
 /// `encode_timeout` (5 s), so the encode fails here instead of being abandoned on its thread.
 const OUTPUT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -718,6 +736,14 @@ pub struct H265Decoder {
     element: String,
     /// (pipeline, appsrc, appsink); made on the first access unit, since the pipeline is not size-specific
     pipeline: Option<(Pointer, Pointer, Pointer)>,
+    /// the frame ids of the units inside, oldest first: pictures come out in the order the units went in, one per unit
+    /// (as the encoder's `inside` assumes of its access units). A stream whose pictures were *reordered* — HEVC with a
+    /// nonzero reorder depth, which the robot's camera does not use (`ffprobe has_b_frames=0`) — would pair a picture
+    /// with a neighbouring sample's stamp. Fixing that needs the id back out of GStreamer with the buffer, and
+    /// `gst_buffer_get_pts` is a macro rather than a symbol this binding can dlopen
+    inside: VecDeque<u64>,
+    /// how many units may be inside before `decode` waits for a picture ([`frames_inside`])
+    inside_max: u64,
 }
 
 // SAFETY: GStreamer objects are thread-safe; the decoder uses them one call at a time (`&mut self`)
@@ -740,12 +766,19 @@ impl H265Decoder {
             ensure!(!factory.is_null(), "GStreamer has no {element}");
             (api.object_unref)(factory);
         }
-        Ok(H265Decoder { api, element, pipeline: None })
+        Ok(H265Decoder { api, element, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside() })
     }
 
     /// The element in use, e.g. `"avdec_h265"`.
     pub fn element(&self) -> &str {
         &self.element
+    }
+
+    /// How many access units may be inside before [`decode`](Self::decode) waits for a picture, over
+    /// [`frames_inside`]. `0` waits for every picture, which is one decode and one encode in series per frame — what
+    /// capped a 720p stream at ~22 fps, and what a throughput measurement wants, since then every picture comes out.
+    pub fn hold(&mut self, frames: u64) {
+        self.inside_max = frames;
     }
 
     fn stop(&mut self) {
@@ -764,6 +797,8 @@ impl H265Decoder {
     /// new pipeline has no reference pictures, so it shows nothing until a keyframe, which is what is wanted.
     pub fn reset(&mut self) {
         self.stop();
+        // the pictures inside went with the pipeline
+        self.inside.clear();
     }
 
     /// The pipeline for `element`, with `h265parse` in front of it or without.
@@ -793,13 +828,15 @@ impl H265Decoder {
         self.pipeline.is_none()
     }
 
-    /// Feeds one Annex-B access unit, which follows every unit fed before it, and returns the picture it completed as
-    /// packed I420. `None`: nothing yet (no keyframe seen yet, or a unit that completes no picture).
+    /// Feeds one Annex-B access unit, which follows every unit fed before it, and takes the oldest picture out as
+    /// packed I420, with the `frame_id` of the unit **that picture** came from: at once if one is ready, waiting only
+    /// once more than [`frames_inside`] units are inside. `None`: nothing out yet (no keyframe seen yet, a unit that
+    /// completes no picture, or a picture still decoding).
     ///
     /// `size` is the picture's size, which the caller already knows from the stream's sequence parameter set
     /// ([`h265_sps::picture_size`](crate::utils::h265_sps::picture_size)) — cheaper and more direct than reading the
     /// sink's negotiated caps back out of GStreamer, and `packed_i420` fails loudly if the decoder disagrees.
-    pub fn decode(&mut self, access_unit: &[u8], size: (u32, u32)) -> Result<Option<Vec<u8>>> {
+    pub fn decode(&mut self, access_unit: &[u8], size: (u32, u32), frame_id: u64) -> Result<Option<(Vec<u8>, u64)>> {
         if self.pipeline.is_none() {
             let parse = PARSED_INPUT_DECODERS.contains(&self.element.as_str());
             if parse {
@@ -811,13 +848,27 @@ impl H265Decoder {
         }
         let (pipeline, source, sink) = self.pipeline.expect("made above");
         push(self.api, source, access_unit)?;
-        let data = pull(self.api, sink, OUTPUT_TIMEOUT)?;
+        self.inside.push_back(frame_id);
+        let waited = self.inside.len() as u64 > self.inside_max;
+        let data = pull(self.api, sink, if waited { OUTPUT_TIMEOUT } else { Duration::ZERO })?;
         if let Err(error) = check_bus(self.api, pipeline, &self.element) {
             // the stream is not what the decoder expected: everything after this may be built on it
             self.reset();
             return Err(error);
         }
-        data.map(|data| packed_i420(data, size)).transpose()
+        let Some(data) = data else {
+            if waited {
+                // every access unit here holds one coded picture, so one comes out per unit - except for a unit the
+                // decoder could make nothing of. Its id is dropped here rather than left to be handed to the next
+                // picture, which would misstamp every picture of the stream from then on
+                log::debug!("GStreamer {}: no picture from access unit {:?} within {OUTPUT_TIMEOUT:?}", self.element, self.inside.front());
+                self.inside.pop_front();
+            }
+            return Ok(None);
+        };
+        // the oldest unit inside is the one this picture came from
+        let frame_id = self.inside.pop_front().unwrap_or(frame_id);
+        Ok(Some((packed_i420(data, size)?, frame_id)))
     }
 }
 

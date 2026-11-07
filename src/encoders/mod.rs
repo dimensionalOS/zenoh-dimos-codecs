@@ -83,8 +83,22 @@ pub struct Selected {
     pub hardware: Option<Factory>,
 }
 
+/// The GStreamer element `ZDC_VIDEO_ENCODER` names, tried before falling back to software.
+///
+/// It exists because on some machines there is no hardware encoder and the software default is too slow: an RK3588 has
+/// no V4L2 encoder nodes, no VAAPI and no NVENC, so [`select`] reaches zenoh-gateway's openh264 — about 27 fps of 720p
+/// on one of its big cores, under the 30 a camera needs — while GStreamer's `x264enc` on the same core does ~84.
+///
+/// It is not tried unless asked for. `x264enc` is GPL, where openh264 is BSD-licensed with Cisco's patent grant, so
+/// which encoder a build uses is a decision for whoever ships it and not one to make by default. Naming the element
+/// rather than a backend also makes this the way to pin any encoder, e.g. to compare two on one machine.
+fn named_element() -> Option<String> {
+    std::env::var("ZDC_VIDEO_ENCODER").ok().map(|name| name.trim().to_owned()).filter(|name| !name.is_empty())
+}
+
 /// Probes `backend` (with [`Backend::Auto`], each hardware one in turn) by encoding a test frame. An explicitly named
-/// backend that isn't built in or doesn't work is an error; `Auto` falls back to software.
+/// backend that isn't built in or doesn't work is an error; `Auto` falls back to the element `ZDC_VIDEO_ENCODER` names
+/// ([`named_element`]), else software.
 pub fn select(backend: Backend) -> Result<Selected> {
     let software = || Selected { name: "software".into(), factory: None, hardware: None };
     let candidates: &[Backend] = match backend {
@@ -101,10 +115,39 @@ pub fn select(backend: Backend) -> Result<Selected> {
         }
     }
     if backend == Backend::Auto {
+        // an element asked for by name: on a machine with no hardware encoder this is the only way past openh264
+        #[cfg(feature = "gstreamer")]
+        if let Some(name) = named_element() {
+            match probe_element(&name) {
+                Ok(selected) => {
+                    log::info!("no hardware video encoder ({}): {} as ZDC_VIDEO_ENCODER asks", failures.join("; "), selected.name);
+                    return Ok(selected);
+                }
+                Err(error) => failures.push(format!("ZDC_VIDEO_ENCODER={name}: {error:#}")),
+            }
+        }
         log::info!("no hardware video encoder ({}): software H.264", failures.join("; "));
         return Ok(software());
     }
     bail!("{}", failures.join("; "))
+}
+
+/// The GStreamer element called `name`, having encoded a test frame with it. Unlike [`probe`]'s hardware backends this
+/// hands over to software on a later failure (`Fallback`) rather than reporting one: a software element that stops
+/// working is not a wedged device, and there is nothing better to restart it as.
+#[cfg(feature = "gstreamer")]
+fn probe_element(name: &str) -> Result<Selected> {
+    let (frame, target) = probe_frame()?;
+    gstreamer::GstreamerEncoder::with_element(name)?.encode(&frame, &target)?;
+    let owned = name.to_owned();
+    let factory: Factory = Box::new(move || match gstreamer::GstreamerEncoder::with_element(&owned) {
+        Ok(encoder) => Box::new(Fallback::new("gstreamer", encoder)),
+        Err(error) => {
+            log::warn!("{owned}: {error:#}; software H.264 instead");
+            Box::new(H264Encoder::default())
+        }
+    });
+    Ok(Selected { name: format!("gstreamer {name}"), factory: Some(factory), hardware: None })
 }
 
 fn probe(backend: Backend) -> Result<Selected> {

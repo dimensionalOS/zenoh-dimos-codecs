@@ -171,9 +171,36 @@ struct Element {
 pub const H264_SDP_PROFILE: &str = "constrained-baseline";
 
 impl Element {
-    /// The caps filter that holds this encoder to its [`profile`](Self::profile), or nothing.
-    fn profile_caps(&self) -> String {
-        if self.profile.is_empty() { String::new() } else { format!(" video/x-h264,profile={} !", self.profile) }
+    /// What goes between this encoder and the appsink: the byte-stream access units zenoh-gateway wants, held to this
+    /// encoder's [`profile`](Self::profile).
+    ///
+    /// `h264parse config-interval=-1` repeats the parameter sets before every keyframe, which a viewer joining
+    /// mid-stream needs. It lives in `gstreamer1.0-plugins-bad`, which is not everywhere — and without it the pipeline
+    /// would not build at all, so the software encoder was unavailable exactly where there is no hardware one to fall
+    /// back from. Where the parser is missing, the encoder is asked for byte-stream directly instead: x264enc repeats
+    /// SPS and PPS before each keyframe itself when its output is byte-stream (checked: `9,7,8,5,5,5` at every
+    /// keyframe), and `nvv4l2h264enc` has `insert-sps-pps=true` among its settings for the same reason.
+    fn output_chain(&self, api: &Api) -> String {
+        let profile = if self.profile.is_empty() { String::new() } else { format!("profile={},", self.profile) };
+        if has_element(api, "h264parse") {
+            let filter = if self.profile.is_empty() { String::new() } else { format!(" video/x-h264,{profile} !") };
+            format!("{filter} h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au !")
+        } else {
+            format!(" video/x-h264,{profile}stream-format=byte-stream,alignment=au !")
+        }
+    }
+}
+
+/// Whether GStreamer has the element called `name`.
+fn has_element(api: &Api, name: &str) -> bool {
+    // SAFETY: the factory reference is released at once
+    unsafe {
+        let factory = (api.element_factory_find)(c_string(name).as_ptr());
+        let found = !factory.is_null();
+        if found {
+            (api.object_unref)(factory);
+        }
+        found
     }
 }
 
@@ -349,15 +376,16 @@ impl Pipeline {
             // decoded, scaled and encoded without leaving the GPU's memory (queues: each stage on its own thread); on the
             // R1 under load 35 a 1920x1536 frame took 4 ms, against 26-60 decoded and scaled on the CPU and copied in
             Some((jpeg_width, jpeg_height)) => format!(
-                "appsrc name=source is-live=true do-timestamp=true format=time caps=image/jpeg,width={jpeg_width},height={jpeg_height},framerate={rate}/1000 ! jpegparse ! queue ! nvjpegdec ! video/x-raw(memory:NVMM) ! queue ! nvvidconv ! video/x-raw(memory:NVMM),format=I420,width={width},height={height} ! queue ! {} name=encoder ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false",
-                element.name
+                "appsrc name=source is-live=true do-timestamp=true format=time caps=image/jpeg,width={jpeg_width},height={jpeg_height},framerate={rate}/1000 ! jpegparse ! queue ! nvjpegdec ! video/x-raw(memory:NVMM) ! queue ! nvvidconv ! video/x-raw(memory:NVMM),format=I420,width={width},height={height} ! queue ! {} name=encoder !{} appsink name=sink sync=false",
+                element.name,
+                element.output_chain(api),
             ),
             // colorimetry 2:4:5:1: limited range, BT.601 matrix, BT.709 transfer and primaries (zenoh-gateway's pictures)
             None => format!(
-                "appsrc name=source is-live=true do-timestamp=true format=time caps=video/x-raw,format=I420,width={width},height={height},framerate={rate}/1000,colorimetry=2:4:5:1 ! {} {} name=encoder !{} h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false",
+                "appsrc name=source is-live=true do-timestamp=true format=time caps=video/x-raw,format=I420,width={width},height={height},framerate={rate}/1000,colorimetry=2:4:5:1 ! {} {} name=encoder !{} appsink name=sink sync=false",
                 element.upload,
                 element.name,
-                element.profile_caps(),
+                element.output_chain(api),
             ),
         };
         let mut error = null_mut();

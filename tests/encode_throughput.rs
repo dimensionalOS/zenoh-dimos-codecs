@@ -87,3 +87,49 @@ fn h264_encode_throughput_at_the_camera_s_size() {
     println!("two cameras at 30 Hz need 60 fps of encode: this machine {}", if fps >= 80.0 { "has room" } else { "does NOT — the encode half needs hardware too" });
     assert!(encoded > 20, "only {encoded} frames encoded");
 }
+
+/// `ZDC_VIDEO_ENCODER` is the way past openh264 on a machine with no hardware encoder, which is what an RK3588 is.
+/// This says the selection works and prints what the named element does against the software default.
+#[test]
+#[cfg(feature = "gstreamer")]
+fn a_named_gstreamer_encoder_is_selected_and_measured() {
+    use zenoh_dimos_codecs::encoders::{Backend, select};
+    // SAFETY: single-threaded test; the variable is read only inside `select`
+    unsafe { std::env::remove_var("ZDC_VIDEO_ENCODER") };
+    let plain = select(Backend::Auto).expect("auto always selects something");
+    println!("unset:                 {}", plain.name);
+
+    // SAFETY: as above
+    unsafe { std::env::set_var("ZDC_VIDEO_ENCODER", "x264enc") };
+    let named = select(Backend::Auto).expect("auto falls back to software if x264enc is missing");
+    println!("ZDC_VIDEO_ENCODER=x264enc: {}", named.name);
+    // SAFETY: as above
+    unsafe { std::env::remove_var("ZDC_VIDEO_ENCODER") };
+
+    let Some(factory) = named.factory else {
+        println!("x264enc is not installed here: nothing to measure");
+        return;
+    };
+    assert_eq!(named.name, "gstreamer x264enc", "the named element was selected");
+
+    let pictures = pictures();
+    if pictures.is_empty() {
+        return;
+    }
+    let (width, height) = (pictures[0].width(), pictures[0].height());
+    let target = VideoTarget::new(width, height, 4_000_000, 30.0);
+    let mut encoder = factory();
+    for picture in &pictures {
+        let _ = encoder.encode(&DecodedFrame::Video(picture.clone()), &target);
+    }
+    let started = Instant::now();
+    let mut encoded = 0;
+    for picture in &pictures {
+        if let Ok(Some(_)) = encoder.encode(&DecodedFrame::Video(picture.clone()), &target) {
+            encoded += 1;
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!("x264enc: {encoded} frames of {width}x{height} in {:.0} ms = {:.1} fps ({:.1} ms/frame)", elapsed * 1000.0, encoded as f64 / elapsed, elapsed * 1000.0 / encoded.max(1) as f64);
+    assert!(encoded > 20, "only {encoded} frames encoded");
+}

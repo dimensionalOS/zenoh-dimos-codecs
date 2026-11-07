@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zenoh_gateway::{DecodedFrame, EncodedVideo, VideoEncoder, VideoFormat, VideoTarget};
 
 type Pointer = *mut c_void;
@@ -727,6 +727,43 @@ const PARSED_INPUT_DECODERS: &[&str] = &["mppvideodec", "v4l2h265dec", "nvv4l2de
 /// pipeline shows one `source:src` thread per core), so the decoder says so itself.
 static PIPELINES: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 
+/// Where a decode call's wall clock goes, reported every [`DECODE_REPORT`] calls.
+///
+/// The gateway measured 31.5 ms a frame for a stream whose raw serial decode on the same core is 11.1 ms, and no
+/// counter could say where the other 20 ms went. These are the parts of the call, in the order it runs them: the work
+/// is memory as much as it is the codec (a 720p picture is 1.38 MB, and copying it three times costs more than
+/// decoding it on some machines), so each is timed rather than reasoned about.
+#[derive(Default)]
+struct Timings {
+    calls: u64,
+    /// handing the access unit to appsrc (a buffer allocation and a copy of the compressed frame)
+    push: Duration,
+    /// taking the picture out: the decode itself happens on the pipeline's own thread, so this is the part of it that
+    /// was not already done when we asked
+    pull: Duration,
+    /// reading the pipeline's error bus
+    bus: Duration,
+    /// repacking GStreamer's padded rows into packed I420, where its stride is not the picture's width
+    repack: Duration,
+}
+
+impl Timings {
+    fn line(&self, element: &str) -> String {
+        let each = |part: Duration| part.as_secs_f64() * 1000.0 / self.calls.max(1) as f64;
+        format!(
+            "{element}: {} calls, each: push {:.2}, pull {:.2}, bus {:.2}, repack {:.2} ms",
+            self.calls,
+            each(self.push),
+            each(self.pull),
+            each(self.bus),
+            each(self.repack)
+        )
+    }
+}
+
+/// Decode calls between timing lines: ~5 s at 30 Hz.
+const DECODE_REPORT: u64 = 150;
+
 /// (live, ever made) decoder pipelines. One per stream is right; one more per resync was the shape of a bug.
 pub fn decoder_pipelines() -> (u64, u64) {
     (PIPELINES.0.load(Ordering::Relaxed), PIPELINES.1.load(Ordering::Relaxed))
@@ -760,6 +797,8 @@ pub struct H265Decoder {
     inside_max: u64,
     /// samples were lost: nothing goes in until a keyframe, which is what makes the picture whole again
     after_gap: bool,
+    /// where the calls' wall clock goes ([`Timings`])
+    timings: Timings,
     /// pipelines this decoder has built: one is right, and one per lost sample was the shape of a bug
     made: u64,
 }
@@ -788,7 +827,7 @@ impl H265Decoder {
             ensure!(!factory.is_null(), "GStreamer has no {factory_name}");
             (api.object_unref)(factory);
         }
-        Ok(H265Decoder { api, element, factory: factory_name, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside(), after_gap: false, made: 0 })
+        Ok(H265Decoder { api, element, factory: factory_name, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside(), after_gap: false, made: 0, timings: Timings::default() })
     }
 
     /// The element in use, e.g. `"avdec_h265"`.
@@ -896,11 +935,23 @@ impl H265Decoder {
             log::info!("H.265 decoder pipeline started ({}): {live} live, {made} made", self.element);
         }
         let (pipeline, source, sink) = self.pipeline.expect("made above");
+        let part = Instant::now();
         push(self.api, source, access_unit)?;
         self.inside.push_back(frame_id);
+        self.timings.calls += 1;
+        self.timings.push += part.elapsed();
         let waited = self.inside.len() as u64 > self.inside_max;
+        let part = Instant::now();
         let data = pull(self.api, sink, if waited { OUTPUT_TIMEOUT } else { Duration::ZERO })?;
-        if let Err(error) = check_bus(self.api, pipeline, &self.element) {
+        self.timings.pull += part.elapsed();
+        let part = Instant::now();
+        let bus = check_bus(self.api, pipeline, &self.element);
+        self.timings.bus += part.elapsed();
+        if self.timings.calls >= DECODE_REPORT {
+            log::info!("H.265 decode {}", self.timings.line(&self.element));
+            self.timings = Timings::default();
+        }
+        if let Err(error) = bus {
             // the stream is not what the decoder expected: everything after this may be built on it
             self.reset();
             return Err(error);
@@ -917,7 +968,10 @@ impl H265Decoder {
         };
         // the oldest unit inside is the one this picture came from
         let frame_id = self.inside.pop_front().unwrap_or(frame_id);
-        Ok(Some((packed_i420(data, size)?, frame_id)))
+        let part = Instant::now();
+        let picture = packed_i420(data, size)?;
+        self.timings.repack += part.elapsed();
+        Ok(Some((picture, frame_id)))
     }
 }
 
@@ -951,6 +1005,22 @@ fn at_least((width, height): (u32, u32), (min_width, min_height): (u32, u32)) ->
 
 #[cfg(test)]
 mod tests {
+    /// The decoder's own parts, as the line reports them. `pull` is the one that matters: it is the part of the decode
+    /// that was **not** already done when the picture was asked for, so a large `pull` is a decoder that is not
+    /// keeping up (or not being scheduled), while a large `push` or `repack` is work this code is doing itself.
+    #[test]
+    fn the_decode_timing_line_separates_waiting_from_working() {
+        let timings = super::Timings {
+            calls: 150,
+            push: std::time::Duration::from_micros(3_000),
+            pull: std::time::Duration::from_millis(39),
+            bus: std::time::Duration::from_micros(150),
+            repack: std::time::Duration::from_micros(0),
+        };
+        assert_eq!(timings.line("avdec_h265"), "avdec_h265: 150 calls, each: push 0.02, pull 0.26, bus 0.00, repack 0.00 ms");
+        assert!(!super::Timings::default().line("avdec_h265").contains("NaN"));
+    }
+
     use super::*;
 
     #[test]

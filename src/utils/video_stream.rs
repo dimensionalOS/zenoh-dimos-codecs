@@ -17,6 +17,7 @@ use super::h265;
 use crate::codecs::msgs::{CompressedVideo, Header};
 use anyhow::{Context, Result, bail};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoImage};
 
 /// How a compressed-video encoding reads its own wire format (`ros2_compressed_video`'s CDR,
@@ -140,7 +141,44 @@ pub struct CompressedVideoStream {
     headers: VecDeque<(u64, Header)>,
     /// how many samples the decoder may hold, to set on it once it is made ([`CompressedVideoStream::hold`])
     hold: Option<u64>,
+    /// where the samples' wall clock goes ([`Timings`])
+    timings: Timings,
 }
+
+/// Where a sample's whole journey to a picture goes, reported every [`STREAM_REPORT`] samples.
+///
+/// The decoder's own parts are timed inside it; these are the parts around it, which on one machine were 0.35 ms a
+/// frame all told and on a robot were apparently 20 ms. Every step from the payload to the `DecodedFrame` is here, so
+/// that the next measurement leaves nothing unattributed.
+#[derive(Default)]
+struct Timings {
+    samples: u64,
+    /// reading the message out of its wire format
+    parse: Duration,
+    /// rebuilding the access unit (start codes) and putting the parameter sets back in front of a keyframe
+    prepare: Duration,
+    /// the decoder, whose own parts it reports separately
+    decode: Duration,
+    /// wrapping the picture with its message header
+    wrap: Duration,
+}
+
+impl Timings {
+    fn line(&self) -> String {
+        let each = |part: Duration| part.as_secs_f64() * 1000.0 / self.samples.max(1) as f64;
+        format!(
+            "{} samples, each: parse {:.2}, prepare {:.2}, decode {:.2}, wrap {:.2} ms",
+            self.samples,
+            each(self.parse),
+            each(self.prepare),
+            each(self.decode),
+            each(self.wrap)
+        )
+    }
+}
+
+/// Samples between timing lines: ~5 s at 30 Hz, matching the decoder's own.
+const STREAM_REPORT: u64 = 150;
 
 /// Headers kept waiting for their picture. The decoder holds one frame, so two is the working depth; the rest is slack
 /// for a unit that completes no picture, whose header is dropped when a later one's picture comes out.
@@ -149,7 +187,7 @@ const HEADERS_MAX: usize = 8;
 impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
     pub fn new(parse: Parse) -> Self {
-        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None }
+        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None, last_frame_id: None, headers: VecDeque::new(), hold: None, timings: Timings::default() }
     }
 
     /// Decoder pipelines this stream has built, where its decoder builds one (GStreamer): **one** for a stream, for
@@ -174,18 +212,27 @@ impl CompressedVideoStream {
 
 impl StreamDecoder for CompressedVideoStream {
     fn decode(&mut self, sample: &EncodingSample<'_>, frame_id: u64) -> Result<Option<DecodedFrame>> {
+        let part = Instant::now();
         let message = (self.parse)(sample.payload)?;
+        self.timings.samples += 1;
+        self.timings.parse += part.elapsed();
+        if self.timings.samples >= STREAM_REPORT {
+            log::info!("H.265 stream {}", self.timings.line());
+            self.timings = Timings::default();
+        }
         match Codec::from_format(&message.format)? {
             Codec::H265 => {}
             // openh264's decoder would do the same job, but nothing here needs it yet and an untested path is worse
             // than a clear refusal: H.264 keyframes still play through the per-sample decode.
             Codec::H264 => bail!("this stream is H.264, which has no stateful decoder here (its keyframes still play one by one)"),
         }
+        let part = Instant::now();
         let unit = compressed_video::to_access_unit(message.data, &message.format)?;
         let (data, keyframe) = compressed_video::decodable(&unit, &mut self.parameter_sets);
         if let Some(size) = unit.size {
             self.size = Some(size);
         }
+        self.timings.prepare += part.elapsed();
         let backend = match &mut self.h265 {
             Some(backend) => backend,
             none => {
@@ -200,7 +247,10 @@ impl StreamDecoder for CompressedVideoStream {
         while self.headers.len() > HEADERS_MAX {
             self.headers.pop_front();
         }
-        let Some((picture, picture_id)) = backend.decode(&data, keyframe, self.size, frame_id)? else { return Ok(None) };
+        let part = Instant::now();
+        let decoded = backend.decode(&data, keyframe, self.size, frame_id)?;
+        self.timings.decode += part.elapsed();
+        let Some((picture, picture_id)) = decoded else { return Ok(None) };
         self.last_frame_id = Some(picture_id);
         // the samples before this picture's completed no picture of their own
         while self.headers.front().is_some_and(|(id, _)| *id < picture_id) {
@@ -210,7 +260,10 @@ impl StreamDecoder for CompressedVideoStream {
         // one just read (`every_picture_carries_the_header_of_its_own_sample`). The fallback is that sample's: it is
         // only reached by a decoder that held pictures back past `HEADERS_MAX`, and a stamp a frame or two out beats none
         let header = self.headers.front().filter(|(id, _)| *id == picture_id).map_or(&message.header, |(_, header)| header);
-        Ok(Some(DecodedFrame::Video(header.add_to_video(picture))))
+        let part = Instant::now();
+        let frame = DecodedFrame::Video(header.add_to_video(picture));
+        self.timings.wrap += part.elapsed();
+        Ok(Some(frame))
     }
 
     fn last_frame_id(&self) -> Option<u64> {
@@ -455,6 +508,24 @@ mod tests {
         // and it is still decoding predicted frames off that keyframe
         let pictures = predicted.iter().take(5).enumerate().filter(|(index, unit)| feed(&mut decoder, unit, "h265", 20 + *index as u64, 3_000).unwrap().is_some()).count();
         assert_eq!(pictures, 5, "the stream carries on after the resyncs");
+    }
+
+    /// The timing line is what names the part of a decode nothing else accounts for, so its arithmetic is the whole
+    /// of its value. On this machine the real stream at its real rate costs
+    /// `parse 0.00, prepare 0.07, decode 0.56, wrap 0.00` — a robot reporting 31.5 ms for the same work therefore has
+    /// ~20 ms in one named place, and the line says which.
+    #[test]
+    fn the_timing_line_accounts_for_the_whole_path() {
+        let timings = Timings {
+            samples: 100,
+            parse: Duration::from_micros(400),
+            prepare: Duration::from_millis(7),
+            decode: Duration::from_millis(56),
+            wrap: Duration::from_micros(300),
+        };
+        assert_eq!(timings.line(), "100 samples, each: parse 0.00, prepare 0.07, decode 0.56, wrap 0.00 ms");
+        // nothing measured yet says so rather than dividing by it
+        assert!(!Timings::default().line().contains("NaN"), "{}", Timings::default().line());
     }
 
     #[test]

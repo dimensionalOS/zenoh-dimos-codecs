@@ -15,12 +15,68 @@
 use super::compressed_video::{self, Codec};
 use super::h265;
 use crate::codecs::msgs::CompressedVideo;
-use anyhow::{Result, bail};
-use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder};
+use anyhow::{Context, Result, bail};
+use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoImage};
 
 /// How a compressed-video encoding reads its own wire format (`ros2_compressed_video`'s CDR,
 /// `dimos_lcm_compressed_video`'s LCM), so one decoder serves both.
 pub type Parse = for<'a> fn(&'a [u8]) -> Result<CompressedVideo<'a>>;
+
+/// Which decoder a stream ended up with, since it depends on what is installed.
+enum Backend {
+    /// GStreamer, by default libav's `avdec_h265`: ~91 fps of 720p on an RK3588 A76 core
+    #[cfg(feature = "gstreamer")]
+    Gstreamer(crate::encoders::gstreamer::H265Decoder),
+    /// libde265, loaded with dlopen: ~50 fps on the same core, and the only one where GStreamer is not installed
+    Libde265(h265::Stream),
+}
+
+impl Backend {
+    /// The fastest decoder this machine has. GStreamer first: on the hardware this runs on, libde265 is not fast
+    /// enough for one camera at 30 Hz, let alone two, and `avdec_h265` is nearly twice as quick. libde265 stays as the
+    /// fallback because it needs only a shared library, and it is what a developer machine without GStreamer gets.
+    ///
+    /// `ZDC_H265_BACKEND=libde265` forces the fallback, to compare them on one machine.
+    fn best() -> Result<Self> {
+        let forced = std::env::var("ZDC_H265_BACKEND").unwrap_or_default();
+        #[cfg(feature = "gstreamer")]
+        if forced != "libde265" {
+            match crate::encoders::gstreamer::H265Decoder::new() {
+                Ok(decoder) => {
+                    log::info!("H.265 stream decoding with GStreamer {}", decoder.element());
+                    return Ok(Backend::Gstreamer(decoder));
+                }
+                Err(error) => log::info!("no GStreamer H.265 decoder ({error:#}), falling back to libde265"),
+            }
+        }
+        let _ = &forced;
+        Ok(Backend::Libde265(h265::Stream::new().context("no H.265 decoder: neither a GStreamer one nor libde265")?))
+    }
+
+    /// One access unit in, the picture it completed out. `keyframe`: it is decodable on its own.
+    fn decode(&mut self, access_unit: &[u8], keyframe: bool, size: Option<(u32, u32)>) -> Result<Option<VideoImage>> {
+        match self {
+            #[cfg(feature = "gstreamer")]
+            Backend::Gstreamer(decoder) => {
+                // GStreamer is handed the size because nothing in the pipeline reports it back; before any parameter
+                // set has said what it is there is also no keyframe to start from, so there is nothing to decode yet
+                let Some(size) = size else { return Ok(None) };
+                let _ = keyframe;
+                let Some(data) = decoder.decode(access_unit, size)? else { return Ok(None) };
+                VideoImage::i420(size.0, size.1, data).map(Some)
+            }
+            Backend::Libde265(stream) => stream.push(access_unit, keyframe),
+        }
+    }
+
+    fn resync(&mut self) {
+        match self {
+            #[cfg(feature = "gstreamer")]
+            Backend::Gstreamer(decoder) => decoder.reset(),
+            Backend::Libde265(stream) => stream.resync(),
+        }
+    }
+}
 
 /// Keeps one H.265 decoder for a stream of `foxglove_msgs/CompressedVideo`, so its predicted frames decode.
 ///
@@ -29,15 +85,17 @@ pub type Parse = for<'a> fn(&'a [u8]) -> Result<CompressedVideo<'a>>;
 /// libde265 and its threads for nothing.
 pub struct CompressedVideoStream {
     parse: Parse,
-    h265: Option<h265::Stream>,
+    h265: Option<Backend>,
     /// the newest parameter sets, to put back in front of a keyframe that arrives without them
     parameter_sets: Option<Vec<u8>>,
+    /// the newest size any sequence parameter set gave: the units between keyframes carry none
+    size: Option<(u32, u32)>,
 }
 
 impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
     pub fn new(parse: Parse) -> Self {
-        CompressedVideoStream { parse, h265: None, parameter_sets: None }
+        CompressedVideoStream { parse, h265: None, parameter_sets: None, size: None }
     }
 }
 
@@ -52,16 +110,20 @@ impl StreamDecoder for CompressedVideoStream {
         }
         let unit = compressed_video::to_access_unit(message.data, &message.format)?;
         let (data, keyframe) = compressed_video::decodable(&unit, &mut self.parameter_sets);
-        let stream = match &mut self.h265 {
-            Some(stream) => stream,
-            none => none.insert(h265::Stream::new()?),
+        if let Some(size) = unit.size {
+            self.size = Some(size);
+        }
+        let backend = match &mut self.h265 {
+            Some(backend) => backend,
+            none => none.insert(Backend::best()?),
         };
-        Ok(stream.push(&data, keyframe)?.map(|picture| DecodedFrame::Video(message.header.add_to_video(picture))))
+        let picture = backend.decode(&data, keyframe, self.size)?;
+        Ok(picture.map(|picture| DecodedFrame::Video(message.header.add_to_video(picture))))
     }
 
     fn resync(&mut self) {
-        if let Some(stream) = &mut self.h265 {
-            stream.resync();
+        if let Some(backend) = &mut self.h265 {
+            backend.resync();
         }
         // the parameter sets are kept: they describe the stream, not the frames that were lost
     }
@@ -109,6 +171,49 @@ mod tests {
             .map(|(_, unit)| [&[0, 0, 0, 1][..], unit].concat())
             .collect();
         (fixture("compressed/m20_front_keyframe.h265"), predicted)
+    }
+
+    /// Both backends decode the robot's real stream, so the choice between them is speed, not capability. Run with
+    /// `--nocapture` to see which each one used and how fast it was.
+    #[test]
+    fn every_backend_decodes_the_real_stream_at_the_same_size() {
+        let (keyframe, predicted) = capture();
+        let mut any = false;
+        for forced in ["", "libde265"] {
+            // SAFETY: single-threaded test, and the variable is only read when a backend is made
+            unsafe { std::env::set_var("ZDC_H265_BACKEND", forced) };
+            let Ok(mut backend) = Backend::best() else {
+                eprintln!("no backend for ZDC_H265_BACKEND={forced:?}: skipping");
+                continue;
+            };
+            let name = match &backend {
+                #[cfg(feature = "gstreamer")]
+                Backend::Gstreamer(decoder) => format!("gstreamer {}", decoder.element()),
+                Backend::Libde265(_) => "libde265".to_owned(),
+            };
+            let mut sets = None;
+            let unit = compressed_video::to_access_unit(&keyframe, "h265").unwrap();
+            let (data, is_key) = compressed_video::decodable(&unit, &mut sets);
+            let size = unit.size.expect("the keyframe carries an SPS");
+            let started = std::time::Instant::now();
+            let first = backend.decode(&data, is_key, Some(size)).unwrap().expect("the keyframe decodes");
+            assert_eq!((first.width(), first.height()), (1280, 720), "{name}");
+            let mut pictures = 1;
+            for unit in &predicted {
+                let unit = compressed_video::to_access_unit(unit, "h265").unwrap();
+                let (data, is_key) = compressed_video::decodable(&unit, &mut sets);
+                if backend.decode(&data, is_key, Some(size)).unwrap().is_some() {
+                    pictures += 1;
+                }
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(pictures, 1 + predicted.len(), "{name} decoded only {pictures} of {}", 1 + predicted.len());
+            eprintln!("{name}: {pictures} pictures of 1280x720 in {:.0} ms = {:.0} fps", elapsed * 1000.0, pictures as f64 / elapsed);
+            any = true;
+        }
+        // SAFETY: as above
+        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
+        assert!(any, "no H.265 decoder at all on this machine");
     }
 
     #[test]

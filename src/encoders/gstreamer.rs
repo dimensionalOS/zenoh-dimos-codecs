@@ -156,6 +156,25 @@ struct Element {
     keyframe_interval: &'static [&'static str],
     /// the least width and height it encodes (smaller pictures are scaled up to it, keeping their shape)
     min_size: (u32, u32),
+    /// the H.264 profile to hold the encoder to, as a caps filter behind it (`""`: whatever it negotiates).
+    ///
+    /// zenoh-gateway offers its H.264 tracks as `profile-level-id=42e01f`, constrained baseline
+    /// ([`H264_SDP_PROFILE`]), so an encoder that negotiates something richer is sending a browser a stream it was
+    /// not offered — which shows up as a black picture or a decoder error, not as a clean failure. The hardware
+    /// elements are already configured for a baseline-ish profile by their own settings and are not all able to
+    /// honour a caps filter, so this is set only where it is needed and testable.
+    profile: &'static str,
+}
+
+/// The H.264 profile zenoh-gateway advertises in SDP (`profile-level-id=42e01f`), which an encoder behind it must
+/// actually produce. Kept here beside the encoders so the two cannot drift apart silently, as they had.
+pub const H264_SDP_PROFILE: &str = "constrained-baseline";
+
+impl Element {
+    /// The caps filter that holds this encoder to its [`profile`](Self::profile), or nothing.
+    fn profile_caps(&self) -> String {
+        if self.profile.is_empty() { String::new() } else { format!(" video/x-h264,profile={} !", self.profile) }
+    }
 }
 
 /// Hardware encoders, in the order they are tried.
@@ -168,13 +187,20 @@ static HARDWARE: [Element; 4] = [
         keyframe_interval: &["iframeinterval", "idrinterval"],
         // under 160 wide or 64 high every frame failed (BlockSide error 0x4) on the R1's Orin, L4T 36
         min_size: (160, 64),
+        // its own `profile: 0` setting above is baseline
+        profile: "",
     },
-    Element { name: "nvh264enc", upload: "", kbps: true, settings: &[("rc-mode", "cbr"), ("preset", "low-latency-hp"), ("zerolatency", "true"), ("bframes", "0")], keyframe_interval: &["gop-size"], min_size: (0, 0) },
-    Element { name: "vah264enc", upload: "videoconvert ! video/x-raw,format=NV12 !", kbps: true, settings: &[("rate-control", "cbr"), ("b-frames", "0"), ("target-usage", "7")], keyframe_interval: &["key-int-max"], min_size: (0, 0) },
-    Element { name: "vaapih264enc", upload: "videoconvert ! video/x-raw,format=NV12 !", kbps: true, settings: &[("rate-control", "cbr"), ("max-bframes", "0")], keyframe_interval: &["keyframe-period"], min_size: (0, 0) },
+    Element { profile: "", name: "nvh264enc", upload: "", kbps: true, settings: &[("rc-mode", "cbr"), ("preset", "low-latency-hp"), ("zerolatency", "true"), ("bframes", "0")], keyframe_interval: &["gop-size"], min_size: (0, 0) },
+    Element { profile: "", name: "vah264enc", upload: "videoconvert ! video/x-raw,format=NV12 !", kbps: true, settings: &[("rate-control", "cbr"), ("b-frames", "0"), ("target-usage", "7")], keyframe_interval: &["key-int-max"], min_size: (0, 0) },
+    Element { profile: "", name: "vaapih264enc", upload: "videoconvert ! video/x-raw,format=NV12 !", kbps: true, settings: &[("rate-control", "cbr"), ("max-bframes", "0")], keyframe_interval: &["keyframe-period"], min_size: (0, 0) },
 ];
 /// Software, for trying the pipeline on a machine without a hardware encoder.
-static X264: Element = Element { name: "x264enc", upload: "", kbps: true, settings: &[("tune", "zerolatency"), ("speed-preset", "ultrafast"), ("bframes", "0")], keyframe_interval: &["key-int-max"], min_size: (0, 0) };
+/// Software, for trying the pipeline on a machine without a hardware encoder — and the encoder of choice where there is
+/// no usable hardware one at all: on an RK3588 (no V4L2 encoder nodes, no VAAPI) x264 at `ultrafast` does ~54 fps of
+/// 720p per A76 core against openh264's ~27.
+///
+/// Held to constrained baseline: x264 negotiates high profile by default, which is not what the gateway offered.
+static X264: Element = Element { name: "x264enc", upload: "", kbps: true, settings: &[("tune", "zerolatency"), ("speed-preset", "ultrafast"), ("bframes", "0")], keyframe_interval: &["key-int-max"], min_size: (0, 0), profile: H264_SDP_PROFILE };
 /// The encoder whose pipeline takes JPEG (the Jetson's: nvjpegdec and nvvidconv in front of it).
 pub(crate) const JPEG_ENCODER: &str = "nvv4l2h264enc";
 /// Frames inside the encoder before `encode` waits for one to come out: hardware encoders take a few frame times
@@ -328,9 +354,10 @@ impl Pipeline {
             ),
             // colorimetry 2:4:5:1: limited range, BT.601 matrix, BT.709 transfer and primaries (zenoh-gateway's pictures)
             None => format!(
-                "appsrc name=source is-live=true do-timestamp=true format=time caps=video/x-raw,format=I420,width={width},height={height},framerate={rate}/1000,colorimetry=2:4:5:1 ! {} {} name=encoder ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false",
+                "appsrc name=source is-live=true do-timestamp=true format=time caps=video/x-raw,format=I420,width={width},height={height},framerate={rate}/1000,colorimetry=2:4:5:1 ! {} {} name=encoder !{} h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=sink sync=false",
                 element.upload,
-                element.name
+                element.name,
+                element.profile_caps(),
             ),
         };
         let mut error = null_mut();
@@ -588,6 +615,105 @@ impl JpegDecoder {
         check_bus(self.api, pipeline, "nvjpegdec")?;
         let data = data.with_context(|| format!("nvjpegdec: no picture within {OUTPUT_TIMEOUT:?}"))?;
         packed_i420(data, (width, height))
+    }
+}
+
+/// The element an [`H265Decoder`] decodes with unless `ZDC_H265_GST_DECODER` names another: libav's HEVC decoder,
+/// which GStreamer wraps. On an RK3588 A76 core it does ~91 fps of 720p against libde265's ~50, and libde265 on the
+/// little cores managed 14-18 — software H.265 is only fast enough here with this one.
+///
+/// Set it to `mppvideodec` where the Rockchip VPU is reachable (`librockchip_mpp`, `/dev/mpp_service`): the pipeline is
+/// otherwise identical, which is the point of naming the element rather than hard-coding it.
+const DEFAULT_H265_DECODER: &str = "avdec_h265";
+
+/// H.265 decoded by GStreamer, keeping its state between access units so predicted frames decode.
+///
+/// [`h265::Stream`](crate::utils::h265::Stream) does the same job with libde265, which is the fallback where GStreamer
+/// is not installed; this is several times faster and is what a robot should use. Both are fed the same way — every
+/// access unit of one stream, in order — so they sit behind one `StreamDecoder`.
+///
+/// No parser in the pipeline: the access units handed in are already whole and carry their parameter sets
+/// ([`decodable`](crate::utils::compressed_video::decodable)), so `h265parse` would have nothing to do, and leaving it
+/// out means this works where `gstreamer1.0-plugins-bad` is not installed. The caps say `alignment=au` for that reason;
+/// `alignment=nal` is refused by the decoder.
+pub struct H265Decoder {
+    api: &'static Api,
+    element: String,
+    /// (pipeline, appsrc, appsink); made on the first access unit, since the pipeline is not size-specific
+    pipeline: Option<(Pointer, Pointer, Pointer)>,
+}
+
+// SAFETY: GStreamer objects are thread-safe; the decoder uses them one call at a time (`&mut self`)
+unsafe impl Send for H265Decoder {}
+
+impl Drop for H265Decoder {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl H265Decoder {
+    /// A decoder using `ZDC_H265_GST_DECODER` or [`DEFAULT_H265_DECODER`], if GStreamer has that element.
+    pub fn new() -> Result<Self> {
+        let api = api()?;
+        let element = std::env::var("ZDC_H265_GST_DECODER").unwrap_or_else(|_| DEFAULT_H265_DECODER.to_owned());
+        // SAFETY: the factory reference is released at once
+        unsafe {
+            let factory = (api.element_factory_find)(c_string(&element).as_ptr());
+            ensure!(!factory.is_null(), "GStreamer has no {element}");
+            (api.object_unref)(factory);
+        }
+        Ok(H265Decoder { api, element, pipeline: None })
+    }
+
+    /// The element in use, e.g. `"avdec_h265"`.
+    pub fn element(&self) -> &str {
+        &self.element
+    }
+
+    fn stop(&mut self) {
+        if let Some((pipeline, source, sink)) = self.pipeline.take() {
+            // SAFETY: our references, released once
+            unsafe {
+                (self.api.element_set_state)(pipeline, STATE_NULL);
+                for object in [source, sink, pipeline] {
+                    (self.api.object_unref)(object);
+                }
+            }
+        }
+    }
+
+    /// Throws the decoder away, so the next access unit starts a new one. What a stream does after losing samples: a
+    /// new pipeline has no reference pictures, so it shows nothing until a keyframe, which is what is wanted.
+    pub fn reset(&mut self) {
+        self.stop();
+    }
+
+    /// Feeds one Annex-B access unit, which follows every unit fed before it, and returns the picture it completed as
+    /// packed I420. `None`: nothing yet (no keyframe seen yet, or a unit that completes no picture).
+    ///
+    /// `size` is the picture's size, which the caller already knows from the stream's sequence parameter set
+    /// ([`h265_sps::picture_size`](crate::utils::h265_sps::picture_size)) — cheaper and more direct than reading the
+    /// sink's negotiated caps back out of GStreamer, and `packed_i420` fails loudly if the decoder disagrees.
+    pub fn decode(&mut self, access_unit: &[u8], size: (u32, u32)) -> Result<Option<Vec<u8>>> {
+        if self.pipeline.is_none() {
+            // framerate 0/1: the decoder is driven by what is pushed, not by a clock
+            let description = format!(
+                "appsrc name=source is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 ! {} ! video/x-raw,format=I420 ! appsink name=sink sync=false",
+                self.element
+            );
+            let (pipeline, source, sink) = launch(self.api, &description)?;
+            self.pipeline = Some((pipeline, source, sink));
+        }
+        let (pipeline, source, sink) = self.pipeline.expect("made above");
+        push(self.api, source, access_unit)?;
+        let data = pull(self.api, sink, OUTPUT_TIMEOUT)?;
+        if let Err(error) = check_bus(self.api, pipeline, &self.element) {
+            // the stream is not what the decoder expected: everything after this may be built on it
+            self.reset();
+            return Err(error);
+        }
+        data.map(|data| packed_i420(data, size)).transpose()
     }
 }
 

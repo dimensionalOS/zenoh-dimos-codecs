@@ -21,6 +21,9 @@
 
 #[cfg(feature = "gstreamer")]
 pub mod gstreamer;
+// only GStreamer's pipelines have a streaming thread to place
+#[cfg(feature = "gstreamer")]
+mod pin;
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub mod videotoolbox;
 pub mod process;

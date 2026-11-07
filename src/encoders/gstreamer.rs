@@ -413,7 +413,7 @@ impl Drop for Pipeline {
 }
 
 impl Pipeline {
-    fn new(api: &'static Api, element: &'static Element, (width, height): (u32, u32), jpeg: Option<(u32, u32)>, bitrate_bps: u32, fps: f64, ends: &(String, String)) -> Result<Self> {
+    fn new(api: &'static Api, element: &'static Element, (width, height): (u32, u32), jpeg: Option<(u32, u32)>, bitrate_bps: u32, fps: f64, ends: &(String, String), number: u64) -> Result<Self> {
         let rate = (fps * 1000.0).round().max(1.0) as u64;
         let description = match jpeg {
             // decoded, scaled and encoded without leaving the GPU's memory (queues: each stage on its own thread); on the
@@ -471,6 +471,8 @@ impl Pipeline {
             }
             pipeline.set_bitrate(bitrate_bps);
             ensure!((api.element_set_state)(pipeline.pipeline, STATE_PLAYING) != 0, "GStreamer pipeline would not start");
+            // its streaming thread exists now and has nothing to encode yet, which is the moment to put it on a core
+            super::pin::pin(super::pin::Stage::Encode, &ends.0, number);
             Ok(pipeline)
         }
     }
@@ -566,6 +568,8 @@ pub struct GstreamerEncoder {
     /// the names of this encoder's pipeline ends, kept across the rebuilds a size change costs so that the thread
     /// doing its work keeps the same name ([`ends`])
     ends: (String, String),
+    /// the number in those names, so a rebuilt pipeline is pinned back to the core it had
+    number: u64,
 }
 
 impl GstreamerEncoder {
@@ -579,7 +583,8 @@ impl GstreamerEncoder {
             ensure!(!factory.is_null(), "GStreamer has no {name}");
             (api.object_unref)(factory);
         }
-        Ok(GstreamerEncoder { api, element, pipeline: None, last_frame_id: None, ends: ends("enc", next_number(&ENCODERS)) })
+        let number = next_number(&ENCODERS);
+        Ok(GstreamerEncoder { api, element, pipeline: None, last_frame_id: None, ends: ends("enc", number), number })
     }
 
     /// The first hardware encoder that is installed and encodes a test frame.
@@ -634,7 +639,7 @@ impl VideoEncoder for GstreamerEncoder {
         let jpeg = image.jpeg_bytes().filter(|_| self.element.name == JPEG_ENCODER).and_then(|bytes| Some((bytes, crate::hardware_jpeg::hardware_size(bytes)?)));
         let fresh = self.pipeline.as_ref().is_none_or(|pipeline| pipeline.size != size || pipeline.jpeg != jpeg.map(|(_, jpeg_size)| jpeg_size) || (pipeline.fps / target.fps).max(target.fps / pipeline.fps) > RECONFIGURE_RATIO);
         if fresh {
-            self.pipeline = Some(Pipeline::new(self.api, self.element, size, jpeg.map(|(_, jpeg_size)| jpeg_size), target.bitrate_bps, target.fps, &self.ends)?);
+            self.pipeline = Some(Pipeline::new(self.api, self.element, size, jpeg.map(|(_, jpeg_size)| jpeg_size), target.bitrate_bps, target.fps, &self.ends, self.number)?);
             log::info!("GStreamer {} encoding {}x{} on thread {}:src", self.element.name, size.0, size.1, self.ends.0);
         }
         let pipeline = self.pipeline.as_mut().expect("created above");
@@ -660,6 +665,7 @@ pub struct JpegDecoder {
     pipeline: Option<(Pointer, Pointer, Pointer, (u32, u32))>,
     /// the names of its pipeline's ends ([`ends`])
     ends: (String, String),
+    number: u64,
 }
 
 // SAFETY: GStreamer objects are thread-safe; the decoder uses them one call at a time (`&mut self`)
@@ -681,7 +687,8 @@ impl JpegDecoder {
             ensure!(!factory.is_null(), "GStreamer has no nvjpegdec");
             (api.object_unref)(factory);
         }
-        Ok(JpegDecoder { api, pipeline: None, ends: ends("jpeg", next_number(&JPEG_DECODERS)) })
+        let number = next_number(&JPEG_DECODERS);
+        Ok(JpegDecoder { api, pipeline: None, ends: ends("jpeg", number), number })
     }
 
     fn stop(&mut self) {
@@ -703,6 +710,8 @@ impl JpegDecoder {
             let description = format!("appsrc name={} is-live=true format=time caps=image/jpeg,width={width},height={height},framerate=0/1 ! jpegparse ! nvjpegdec ! nvvidconv ! video/x-raw,format=I420,width={width},height={height} ! appsink name={} sync=false", self.ends.0, self.ends.1);
             let (pipeline, source, sink) = launch(self.api, &description, &self.ends.0, &self.ends.1)?;
             self.pipeline = Some((pipeline, source, sink, (width, height)));
+            // as the others: started, nothing pushed into it yet
+            super::pin::pin(super::pin::Stage::Decode, &self.ends.0, self.number);
         }
         let (pipeline, source, sink, _) = self.pipeline.expect("made above");
         push(self.api, source, jpeg)?;
@@ -844,6 +853,8 @@ pub struct H265Decoder {
     timings: Timings,
     /// the names of its pipeline's ends, kept across a rebuild so the thread doing its work keeps its name ([`ends`])
     ends: (String, String),
+    /// the number in those names, which is also the core this stream's work is pinned to ([`pin::pin`](super::pin::pin))
+    number: u64,
     /// pipelines this decoder has built: one is right, and one per lost sample was the shape of a bug
     made: u64,
 }
@@ -866,13 +877,14 @@ impl H265Decoder {
         // thread-type=slice"`), which go into the pipeline as they are — so a decoder's threading can be tried on a
         // robot without a build
         let factory_name = element.split_whitespace().next().unwrap_or_default().to_owned();
+        let number = next_number(&H265_DECODERS);
         // SAFETY: the factory reference is released at once
         unsafe {
             let factory = (api.element_factory_find)(c_string(&factory_name).as_ptr());
             ensure!(!factory.is_null(), "GStreamer has no {factory_name}");
             (api.object_unref)(factory);
         }
-        Ok(H265Decoder { api, element, factory: factory_name, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside(), after_gap: false, made: 0, timings: Timings::default(), ends: ends("h265", next_number(&H265_DECODERS)) })
+        Ok(H265Decoder { api, element, factory: factory_name, pipeline: None, inside: VecDeque::new(), inside_max: frames_inside(), after_gap: false, made: 0, timings: Timings::default(), ends: ends("h265", number), number })
     }
 
     /// The element in use, e.g. `"avdec_h265"`.
@@ -975,6 +987,8 @@ impl H265Decoder {
             let description = Self::description(&self.element, parse, &self.ends);
             let (pipeline, source, sink) = launch(self.api, &description, &self.ends.0, &self.ends.1)?;
             self.pipeline = Some((pipeline, source, sink));
+            // as above: started, with nothing pushed into it yet
+            super::pin::pin(super::pin::Stage::Decode, &self.ends.0, self.number);
             self.made += 1;
             let (live, made) = (PIPELINES.0.fetch_add(1, Ordering::Relaxed) + 1, PIPELINES.1.fetch_add(1, Ordering::Relaxed) + 1);
             // one per stream is right; one per resync is the bug this count exists to show

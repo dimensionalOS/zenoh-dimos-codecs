@@ -5376,6 +5376,7 @@ dependencies = [
  "image-webp",
  "jpeg-encoder",
  "jxl-oxide",
+ "libc",
  "libloading 0.9.0",
  "log",
  "openh264",

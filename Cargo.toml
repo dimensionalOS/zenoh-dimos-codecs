@@ -46,6 +46,10 @@ openh264 = "0.9"
 name = "transcode_bench"
 required-features = ["gstreamer"]
 
+# only to put a pipeline's streaming thread on a core of its own (`encoders::pin`); nothing else needs it
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # tests/h265_passthrough runs the Rust client against an in-process server
 zenoh-gateway = { version = "0.5.37", features = ["client"] }

@@ -678,6 +678,31 @@ impl JpegDecoder {
 /// otherwise identical, which is the point of naming the element rather than hard-coding it.
 const DEFAULT_H265_DECODER: &str = "avdec_h265";
 
+/// Decoders whose sink caps ask for `parsed=true`, which only an `h265parse` upstream sets.
+///
+/// **An RK3588's `mppvideodec` is not yet usable through this and needs one more thing tried.** With the parser in
+/// front of it, it still fails at the input with `Internal data stream error` from appsrc. Its sink caps were reported
+/// as `video/x-h265, parsed:true, alignment:au` — with **no `stream-format`**, which is the signature of a hardware
+/// decoder that wants `hvc1`/`hev1` (length-prefixed, parameter sets in `codec_data`) rather than the `byte-stream`
+/// this feeds. The next thing to try is therefore a caps filter converting it, which `h265parse` can do:
+///
+/// ```text
+/// appsrc ! h265parse ! video/x-h265,stream-format=hvc1,alignment=au ! mppvideodec ! videoconvert ! ...
+/// ```
+///
+/// That would be a third shape for [`H265Decoder::description`] rather than another entry here, since it differs in
+/// the caps between the parser and the decoder and not in whether a parser is present. Two attempts have been spent
+/// on this already (the decoder's NV12 output, then `parsed=true`), so it is worth knowing before a third: the
+/// software path is latency-bound, not CPU-bound, and pipelining the decoder fixes that portably on any machine,
+/// where this only ever helps a Rockchip.
+///
+/// A hardware decoder generally wants it; libav's takes byte-stream access units as they are. Feeding one of these
+/// without the parser fails with `Internal data stream error` from appsrc, which looks like the hardware refusing the
+/// stream rather than a missing element - so the list is explicit, and an element not on it keeps the parser-free
+/// pipeline that libav's is known to work with. A decoder that needs the parser and is not named here shows that same
+/// error; add it.
+const PARSED_INPUT_DECODERS: &[&str] = &["mppvideodec", "v4l2h265dec", "nvv4l2decoder", "vah265dec", "vaapih265dec"];
+
 /// H.265 decoded by GStreamer, keeping its state between access units so predicted frames decode.
 ///
 /// [`h265::Stream`](crate::utils::h265::Stream) does the same job with libde265, which is the fallback where GStreamer
@@ -741,6 +766,25 @@ impl H265Decoder {
         self.stop();
     }
 
+    /// The pipeline for `element`, with `h265parse` in front of it or without.
+    ///
+    /// `framerate=0/1`: the decoder is driven by what is pushed, not by a clock.
+    ///
+    /// `videoconvert` because a decoder gives whichever layout it likes and the gateway's pictures are I420: libav's
+    /// gives I420 already and the element is then a passthrough costing nothing, while a hardware one gives NV12 and
+    /// would otherwise refuse to negotiate. Where the conversion does run, a hardware one in front of it
+    /// (`rgaconvert`) keeps it off the CPU.
+    ///
+    /// A pure function so both shapes can be checked on a machine that has neither element - the parser-free one is
+    /// all that a machine without `gstreamer1.0-plugins-bad` can ever run, and an unparsed hardware pipeline is how a
+    /// day was lost once already.
+    fn description(element: &str, parse: bool) -> String {
+        let parser = if parse { " h265parse !" } else { "" };
+        format!(
+            "appsrc name=source is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 !{parser} {element} ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink sync=false"
+        )
+    }
+
     /// Whether the next access unit has to be a keyframe, because there is no pipeline yet or the last one was thrown
     /// away. **Check this before pushing**: a fresh pipeline fed a predicted frame produces nothing, and `decode` then
     /// waits [`OUTPUT_TIMEOUT`] for that nothing — seconds, per frame, for as long as the keyframes are missed. That
@@ -757,15 +801,11 @@ impl H265Decoder {
     /// sink's negotiated caps back out of GStreamer, and `packed_i420` fails loudly if the decoder disagrees.
     pub fn decode(&mut self, access_unit: &[u8], size: (u32, u32)) -> Result<Option<Vec<u8>>> {
         if self.pipeline.is_none() {
-            // framerate 0/1: the decoder is driven by what is pushed, not by a clock
-            let description = format!(
-                // `videoconvert` because a decoder gives whichever layout it likes and the gateway's pictures are
-                // I420: libav's gives I420 already and the element is then a passthrough costing nothing, while a
-                // hardware one (`mppvideodec` on an RK3588) gives NV12 and would otherwise refuse to negotiate at all.
-                // Where the conversion does run it is worth having a hardware one in front of it (`rgaconvert`).
-                "appsrc name=source is-live=true format=time caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=0/1 ! {} ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink sync=false",
-                self.element
-            );
+            let parse = PARSED_INPUT_DECODERS.contains(&self.element.as_str());
+            if parse {
+                ensure!(has_element(self.api, "h265parse"), "{} needs h265parse in front of it (gstreamer1.0-plugins-bad), which GStreamer here does not have", self.element);
+            }
+            let description = Self::description(&self.element, parse);
             let (pipeline, source, sink) = launch(self.api, &description)?;
             self.pipeline = Some((pipeline, source, sink));
         }
@@ -857,6 +897,32 @@ mod tests {
         assert_eq!(&*gstreamer_layout(&packed, (6, 2)), &[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0, 13, 14, 15, 0, 16, 17, 18, 0]);
         let aligned = vec![0u8; 16 * 2 * 3 / 2];
         assert!(matches!(gstreamer_layout(&aligned, (16, 2)), Cow::Borrowed(_)), "a width that is a multiple of 8 is already laid out");
+    }
+
+    /// The hardware decode pipeline cannot be run on a machine with neither `mppvideodec` nor `h265parse`, so its
+    /// shape is checked here instead - the same gap that let a trailing comma into the encoder's caps and cost a
+    /// deploy.
+    #[test]
+    fn both_decode_pipelines_are_well_formed() {
+        let parser_free = H265Decoder::description("avdec_h265", false);
+        let parsed = H265Decoder::description("mppvideodec", true);
+
+        assert!(!parser_free.contains("h265parse"), "libav's decoder takes access units as they are: {parser_free}");
+        assert!(parsed.contains("! h265parse ! mppvideodec !"), "a hardware decoder needs the stream marked parsed: {parsed}");
+        for description in [&parser_free, &parsed] {
+            // every element separated by exactly one `!`, and no empty stage between two of them
+            assert!(!description.contains("!!") && !description.contains("! !"), "an empty stage in {description}");
+            for stage in description.split('!') {
+                assert!(!stage.trim().is_empty(), "an empty stage in {description}");
+            }
+            // and the shape the rest of the decoder relies on either way
+            assert!(description.contains("alignment=au"), "mppvideodec and avdec both refuse alignment=nal: {description}");
+            assert!(description.contains("videoconvert ! video/x-raw,format=I420"), "the gateway's pictures are I420: {description}");
+            assert!(description.contains("name=source") && description.contains("name=sink"), "{description}");
+        }
+        // every decoder known to need the parser is named, so none of them silently gets the parser-free pipeline
+        assert!(PARSED_INPUT_DECODERS.contains(&"mppvideodec"), "the RK3588's decoder is the one this was found with");
+        assert!(!PARSED_INPUT_DECODERS.contains(&DEFAULT_H265_DECODER), "libav's must keep the pipeline it is known to work with");
     }
 
     /// Caps GStreamer cannot parse are a pipeline that cannot be built, and the encoder then falls back silently.

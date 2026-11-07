@@ -4,7 +4,8 @@
 use super::CompressedVideo;
 use crate::utils::{compressed_video, lcm::Lcm};
 use anyhow::Result;
-use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding};
+use crate::utils::video_passthrough::H265Passthrough;
+use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, VideoEncoder, VideoFormat};
 
 /// The LCM fingerprint of dimos-lcm's type, as `lcm-gen` computes it.
 const LCM_COMPRESSED_VIDEO: [u8; 8] = [0x22, 0x17, 0xb4, 0x6e, 0xef, 0xbf, 0x7b, 0x05];
@@ -38,9 +39,19 @@ impl MessageEncoding for DimosLcmCompressedVideo {
         parse(sample.payload).ok().map(|message| message.header.to_gateway())
     }
 
-    fn decode(&self, sample: &EncodingSample<'_>, _channel: Channel) -> Result<DecodedFrame> {
+    fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame> {
         let message = parse(sample.payload)?;
+        // on a passthrough channel the access unit goes to the browser as it is, predicted frames and all
+        if compressed_video::passes_through(channel) {
+            return Ok(DecodedFrame::data(compressed_video::to_access_unit(message.data, &message.format)?));
+        }
         Ok(DecodedFrame::Video(message.header.add_to_video(compressed_video::to_video(message.data, &message.format)?)))
+    }
+
+    /// H.265 straight to the browser, which decodes it in hardware: no decode and re-encode here, so predicted frames
+    /// play too (`video-h265`; only Chrome and Safari offer it, see the client's `playableChannel`).
+    fn video_encoder(&self, format: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
+        (format == VideoFormat::H265).then(|| Box::new(H265Passthrough::default()) as Box<dyn VideoEncoder>)
     }
 }
 

@@ -7,6 +7,7 @@ pub mod compressed_video;
 pub mod depth;
 pub mod h264;
 pub mod h265;
+pub mod h265_sps;
 pub mod jpeg;
 pub mod jxl;
 pub mod lcm;
@@ -14,6 +15,7 @@ pub mod pcm;
 pub mod png;
 pub mod pointcloud;
 pub mod raw_pixels;
+pub mod video_passthrough;
 pub mod webp;
 
 #[cfg(test)]
@@ -25,3 +27,4 @@ pub mod tests {
         std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     }
 }
+

@@ -204,3 +204,82 @@ async fn predicted_frames_reach_a_client_that_can_decode_h265() -> Result<()> {
     running.shutdown().await?;
     Ok(())
 }
+
+/// The deployment this whole thing exists for: a Chrome and a Firefox watching **one** camera at the same time, one
+/// passing the H.265 through and one having it decoded and re-encoded.
+///
+/// What it checks is that the two paths coexist: two connections, two subscriptions and two very different decoders
+/// against one publisher, each getting the format it negotiated, at a rate neither starves, both reporting the same
+/// source picture. Nothing before this ran them together.
+///
+/// What it does **not** check, though it was written to: the decode cache's key. That key was
+/// `(encoding, channel.kind(), hash)`, and `kind()` is `EncodingOutput::Video` for `video-h265` and `video-h264`
+/// alike, so two video subscriptions could be handed each other's frames. Keying it on the whole `Channel` fixed it —
+/// but this test passes with that fix reverted, because the two paths no longer meet in the cache at all: a
+/// subscription with a `StreamDecoder` decodes its own samples and never calls `decode_shared`, so only the
+/// passthrough side uses the cache. The key is still right (it is what actually varies) and still protects an encoding
+/// that decodes per channel without a stream decoder; it is simply no longer load-bearing for this pair, and this test
+/// is no evidence either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_browsers_watch_one_camera_at_once() -> Result<()> {
+    if zenoh_dimos_codecs::utils::h265::Stream::new().is_err() {
+        eprintln!("skipping: libde265 is not installed");
+        return Ok(());
+    }
+    let (running, session, url) = start().await;
+    let _publisher = keep_publishing(&session, "camera/front");
+
+    // two clients, as two browsers are: separate connections, separate subscriptions, one publisher
+    let chrome = Client::connect(&url, ClientOptions::default()).await?;
+    let firefox = Client::connect(&url, ClientOptions::default()).await?;
+    let options = |channel: &str| SubscribeOptions {
+        encoding: Some("ros2_compressed_video".to_owned()),
+        channel: Some(channel.to_owned()),
+        metadata: Some(true),
+        ..Default::default()
+    };
+    let mut passthrough = chrome.subscribe("camera/front", options("video-h265")).await?;
+    let mut reencoded = firefox.subscribe("camera/front", options("video-h264")).await?;
+
+    // both are read at once, so neither can be starved by the other being drained first
+    let ((h265_frames, h265_sizes, h265_time), (h264_frames, h264_sizes, h264_time)) = tokio::join!(
+        take_frames(&mut passthrough, zenoh_gateway::VideoFormat::H265),
+        take_frames(&mut reencoded, zenoh_gateway::VideoFormat::H264),
+    );
+
+    // both well past the one-keyframe-a-second the old path managed, and neither starved by the other
+    assert!(h265_frames >= 15, "passthrough got {h265_frames} frames in {h265_time:?} while the other ran");
+    assert!(h264_frames >= 15, "re-encode got {h264_frames} frames in {h264_time:?} while the other ran");
+    // the same camera, so both report the same source picture - if the cache were crossed these would disagree
+    assert!(h265_sizes.iter().all(|size| *size == (1280, 720)), "passthrough source sizes {h265_sizes:?}");
+    assert!(h264_sizes.iter().all(|size| *size == (1280, 720)), "re-encode source sizes {h264_sizes:?}");
+
+    drop(passthrough);
+    drop(reencoded);
+    chrome.close().await;
+    firefox.close().await;
+    running.shutdown().await?;
+    Ok(())
+}
+
+/// Reads frames off `subscription` until it has 15 or runs out of patience, checking every one is `want`; gives back
+/// how many came, the source sizes their metadata reported, and how long it took.
+async fn take_frames(
+    subscription: &mut zenoh_gateway::client::Subscription,
+    want: zenoh_gateway::VideoFormat,
+) -> (usize, Vec<(u32, u32)>, Duration) {
+    let (mut frames, mut sizes) = (0usize, Vec::new());
+    let started = Instant::now();
+    while frames < 15 && started.elapsed() < Duration::from_secs(25) {
+        match tokio::time::timeout(Duration::from_secs(12), subscription.recv()).await {
+            Ok(Some(Message::Video(frame))) => {
+                assert_eq!(frame.format, want, "a {want:?} subscription got {:?}", frame.format);
+                frames += 1;
+            }
+            Ok(Some(Message::VideoInfo(info))) if info.source_width > 0 => sizes.push((info.source_width, info.source_height)),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    (frames, sizes, started.elapsed())
+}

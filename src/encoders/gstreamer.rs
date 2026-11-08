@@ -246,17 +246,17 @@ pub(crate) const JPEG_ENCODER: &str = "nvv4l2h264enc";
 ///
 /// It is also latency: a frame held is a frame not sent, and three of them at 30 Hz is up to 100 ms, which on a robot
 /// whose encode costs 1.6 ms buys nothing. The gateway drains what is inside between inputs, so the cost is usually
-/// less — `ZDC_GST_IN_FLIGHT` is there to measure what it actually is on a machine, against 1 and 0.
+/// less — [`Settings::gst_in_flight`](crate::settings::Settings::gst_in_flight) is there to measure what it actually
+/// is on a machine, against 1 and 0.
 fn max_in_flight() -> u64 {
-    static IN_FLIGHT: OnceLock<u64> = OnceLock::new();
-    *IN_FLIGHT.get_or_init(|| std::env::var("ZDC_GST_IN_FLIGHT").ok().and_then(|value| value.parse().ok()).unwrap_or(3))
+    crate::settings::settings().gst_in_flight as u64
 }
 /// The same for a pipeline that takes JPEG: its decoder, converter and encoder each hold frames (on the R1, ~40 ms from
 /// JPEG to H.264 idle, longer under load), and waiting for each output at 3 inside cost ~35 ms a frame, which zenoh-gateway's
-/// CPU governor took for encoding cost and shrank the picture for. `ZDC_GST_JPEG_IN_FLIGHT` overrides it.
+/// CPU governor took for encoding cost and shrank the picture for.
+/// [`Settings::gst_jpeg_in_flight`](crate::settings::Settings::gst_jpeg_in_flight) overrides it.
 fn jpeg_in_flight() -> u64 {
-    static IN_FLIGHT: OnceLock<u64> = OnceLock::new();
-    *IN_FLIGHT.get_or_init(|| std::env::var("ZDC_GST_JPEG_IN_FLIGHT").ok().and_then(|value| value.parse().ok()).unwrap_or(6))
+    crate::settings::settings().gst_jpeg_in_flight as u64
 }
 /// Access units inside the decoder before `decode` waits for a picture to come out.
 ///
@@ -269,12 +269,11 @@ fn jpeg_in_flight() -> u64 {
 /// decoding during that interval, so what this costs is `interval - decode`, not a whole interval: 33 - 26 = 7 ms at
 /// 30 Hz on that core, for 22 -> 30 fps. Where the decode is slower than the interval it costs nothing at all. That is
 /// also why it is one and not three: the gateway sends one picture per `decode` call, so deeper slack buys no more
-/// overlap and does add a whole interval each. `ZDC_H265_FRAMES_INSIDE=0` waits for every picture, as before — the
-/// serial behaviour, to measure against.
-const FRAMES_INSIDE: u64 = 1;
-
+/// overlap and does add a whole interval each.
+/// [`Settings::h265_frames_inside`](crate::settings::Settings::h265_frames_inside)` = 0` waits for every picture, as
+/// before — the serial behaviour, to measure against.
 fn frames_inside() -> u64 {
-    std::env::var("ZDC_H265_FRAMES_INSIDE").ok().and_then(|value| value.parse().ok()).unwrap_or(FRAMES_INSIDE)
+    crate::settings::settings().h265_frames_inside as u64
 }
 /// How long that wait may last (the first frame's includes the pipeline's start); under zenoh-gateway's default
 /// `encode_timeout` (5 s), so the encode fails here instead of being abandoned on its thread.
@@ -725,7 +724,7 @@ impl JpegDecoder {
     }
 }
 
-/// The element an [`H265Decoder`] decodes with unless `ZDC_H265_GST_DECODER` names another: libav's HEVC decoder,
+/// The element an [`H265Decoder`] decodes with unless the settings name another: libav's HEVC decoder,
 /// which GStreamer wraps. On an RK3588 A76 core it does ~91 fps of 720p against libde265's ~50, and libde265 on the
 /// little cores managed 14-18 — software H.265 is only fast enough here with this one.
 ///
@@ -870,11 +869,11 @@ impl Drop for H265Decoder {
 }
 
 impl H265Decoder {
-    /// A decoder using `ZDC_H265_GST_DECODER` or [`DEFAULT_H265_DECODER`], if GStreamer has that element.
+    /// A decoder using [`Settings::h265_gst_decoder`](crate::settings::Settings::h265_gst_decoder), if GStreamer has that element.
     pub fn new() -> Result<Self> {
         let api = api()?;
-        let element = std::env::var("ZDC_H265_GST_DECODER").unwrap_or_else(|_| DEFAULT_H265_DECODER.to_owned());
-        // the first word is the factory; what follows is properties for it (`ZDC_H265_GST_DECODER="avdec_h265
+        let element = crate::settings::settings().h265_gst_decoder.clone();
+        // the first word is the factory; what follows is properties for it (`h265_gst_decoder = "avdec_h265
         // thread-type=slice"`), which go into the pipeline as they are — so a decoder's threading can be tried on a
         // robot without a build
         let factory_name = element.split_whitespace().next().unwrap_or_default().to_owned();

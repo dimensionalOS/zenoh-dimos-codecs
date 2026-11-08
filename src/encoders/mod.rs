@@ -86,7 +86,7 @@ pub struct Selected {
     pub hardware: Option<Factory>,
 }
 
-/// The GStreamer element `ZDC_VIDEO_ENCODER` names, tried before falling back to software.
+/// The GStreamer element [`Settings::video_encoder`](crate::settings::Settings::video_encoder) names, tried before falling back to software.
 ///
 /// It exists because on some machines there is no hardware encoder and the software default is too slow: an RK3588 has
 /// no V4L2 encoder nodes, no VAAPI and no NVENC, so [`select`] reaches zenoh-gateway's openh264 — about 27 fps of 720p
@@ -102,12 +102,13 @@ fn hardware_note(failures: &[String]) -> String {
 }
 
 fn named_element() -> Option<String> {
-    std::env::var("ZDC_VIDEO_ENCODER").ok().map(|name| name.trim().to_owned()).filter(|name| !name.is_empty())
+    let name = crate::settings::settings().video_encoder.as_deref()?.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Probes `backend` (with [`Backend::Auto`], each hardware one in turn) by encoding a test frame. An explicitly named
 /// backend that isn't built in or doesn't work is an error; `Auto` and `Software` fall back to the element
-/// `ZDC_VIDEO_ENCODER` names ([`named_element`]), else zenoh-gateway's own.
+/// the settings name ([`named_element`]), else zenoh-gateway's own.
 pub fn select(backend: Backend) -> Result<Selected> {
     let software = || Selected { name: "software".into(), factory: None, hardware: None };
     let candidates: &[Backend] = match backend {
@@ -132,18 +133,18 @@ pub fn select(backend: Backend) -> Result<Selected> {
         if let Some(name) = named_element() {
             match probe_element(&name) {
                 Ok(selected) => {
-                    log::info!("video encoder: {} as ZDC_VIDEO_ENCODER asks{}", selected.name, hardware_note(&failures));
+                    log::info!("video encoder: {} as the settings ask{}", selected.name, hardware_note(&failures));
                     return Ok(selected);
                 }
                 // loudly: someone naming an encoder meant it, and silently encoding with another is how an hour goes
-                Err(error) => log::warn!("ZDC_VIDEO_ENCODER={name} cannot encode ({error:#}): software H.264 instead"),
+                Err(error) => log::warn!("video_encoder={name} cannot encode ({error:#}): software H.264 instead"),
             }
         }
         // a build without the `gstreamer` feature cannot make the element asked for; saying so beats encoding with
         // another and leaving someone to wonder why the one they named made no difference
         #[cfg(not(feature = "gstreamer"))]
         if let Some(name) = named_element() {
-            log::warn!("ZDC_VIDEO_ENCODER={name} needs this crate's `gstreamer` feature, which this build does not have: software H.264 instead");
+            log::warn!("video_encoder={name} needs this crate's `gstreamer` feature, which this build does not have: software H.264 instead");
         }
         log::info!("video encoder: software H.264{}", hardware_note(&failures));
         return Ok(software());

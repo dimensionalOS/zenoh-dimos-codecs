@@ -13,10 +13,11 @@
 //! So it is done here, in the moment between a pipeline reaching `PLAYING` and the first buffer being pushed into it:
 //! the thread exists, has done no work yet, and a rebuild comes back through the same path.
 //!
-//! **Off unless `ZDC_PIN_PIPELINES` is set**, because which core a robot's video should run on is a decision for
-//! whoever deploys it, not for a library. What this provides is the mechanism; the policy is the environment.
+//! **Off unless [`crate::settings::Settings::pin_pipelines`] asks for it**, because which core a robot's video
+//! should run on is a decision for whoever deploys it, not for a library. What this provides is the mechanism;
+//! the policy comes in as configuration.
 
-/// What `ZDC_PIN_PIPELINES` asks for.
+/// What the deployment asked to pin.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Scope {
     /// nothing is pinned; the scheduler places everything
@@ -27,37 +28,24 @@ pub(crate) enum Scope {
     All,
 }
 
-/// What to pin, from `ZDC_PIN_PIPELINES`, read once.
+/// What to pin, from the configured settings, read once.
 ///
-/// **`1` means decoders only**, because that is the shape that was measured to work. A decode is the expensive stage
-/// (12 ms of a 33 ms interval for 720p H.265 in software) and it is the one that needs a core to itself; an encode is
-/// a few milliseconds and places itself perfectly well on whatever is left.
-///
-/// Pinning encoders as well was tried and is worse. A GStreamer encoder has **two** threads of its element's name —
-/// `x264enc` keeps the appsrc's streaming task as well as its own, and `threads=1` caps only the latter — so the pin
-/// confines both to one core, which took an encode from 7 ms to 24-55 ms and two cameras from 29 fps to 15-18. The
-/// built-in software encoder, having no GStreamer pipeline at all, was never pinned and so never suffered that: the
-/// run that passed was decoders pinned and encoders floating. `all` is kept for a machine where that turns out
-/// differently, and says so in the log either way.
+/// **Decoders only is the shape that was measured to work.** A decode is the expensive stage (12 ms of a 33 ms
+/// interval for 720p H.265 in software) and it is the one that needs a core to itself; an encode is a few
+/// milliseconds and places itself perfectly well on whatever is left.
 pub(crate) fn scope() -> Scope {
     static SCOPE: std::sync::OnceLock<Scope> = std::sync::OnceLock::new();
     *SCOPE.get_or_init(|| {
-        let scope = std::env::var("ZDC_PIN_PIPELINES").map(|value| scope_from(value.trim())).unwrap_or(Scope::Off);
+        let scope = match crate::settings::settings().pin_pipelines {
+            crate::settings::PinPipelines::Off => Scope::Off,
+            crate::settings::PinPipelines::Decoders => Scope::Decode,
+            crate::settings::PinPipelines::All => Scope::All,
+        };
         if scope != Scope::Off {
-            log::info!("ZDC_PIN_PIPELINES: pinning {}", if scope == Scope::All { "decoders and encoders" } else { "decoders only (`all` for encoders too)" });
+            log::info!("pinning {}", if scope == Scope::All { "decoders and encoders" } else { "decoders only" });
         }
         scope
     })
-}
-
-/// `""`, `0`, `off`, `no`, `false` are off; `all`, `both`, `encode` include encoders; anything else is decoders only,
-/// so `1` — the obvious thing to write — gets the shape that works rather than the one that does not.
-fn scope_from(value: &str) -> Scope {
-    match value.to_ascii_lowercase().as_str() {
-        "" | "0" | "off" | "no" | "false" => Scope::Off,
-        "all" | "both" | "encode" | "encoders" => Scope::All,
-        _ => Scope::Decode,
-    }
 }
 
 /// Whether `stage` is pinned, and so also whether it is given one thread (the two are only correct together).
@@ -153,12 +141,12 @@ pub(crate) fn pin(stage: Stage, element: &str) {
     }
     let cores = reserved_cores();
     let Some(core) = core_for(stage, element, &cores) else {
-        log::warn!("ZDC_PIN_PIPELINES is set but this process has no cores to choose from; {element} runs where it is put");
+        log::warn!("pinning was asked for but this process has no cores to choose from; {element} runs where it is put");
         return;
     };
     let name = thread_name(element);
     match wait_for_threads(&name) {
-        found if found.is_empty() => log::warn!("ZDC_PIN_PIPELINES: no thread called {name} within {APPEAR_WITHIN:?}, so {element} was not put on core {core} and runs where the scheduler likes"),
+        found if found.is_empty() => log::warn!("pinning: no thread called {name} within {APPEAR_WITHIN:?}, so {element} was not put on core {core} and runs where the scheduler likes"),
         found => {
             // More than one thread of that name is a decoder that has made workers, one per core, which all end up
             // here: the ones already made are pinned now and the ones made later inherit it. Confining a whole pool
@@ -166,7 +154,7 @@ pub(crate) fn pin(stage: Stage, element: &str) {
             // rate. Measured: `avdec_h265` with its default threading made 16 of them on a 16-core machine.
             if found.len() > 1 {
                 log::warn!(
-                    "{element} has {} threads, so pinning puts its whole worker pool on core {core} — that is slower than not pinning. Give the decoder one worker (`ZDC_H265_GST_DECODER=\"avdec_h265 max-threads=1\"`) or turn ZDC_PIN_PIPELINES off",
+                    "{element} has {} threads, so pinning puts its whole worker pool on core {core} — that is slower than not pinning. Give the decoder one worker (`h265_gst_decoder = \"avdec_h265 max-threads=1\"`) or turn pin_pipelines off",
                     found.len()
                 );
             }
@@ -272,20 +260,10 @@ mod tests {
     /// and two cameras from 29 fps to 15-18. The run that passed had the encoders floating.
     #[test]
     fn asking_to_pin_pins_decoders_and_leaves_encoders_alone() {
-        assert_eq!(scope_from("1"), Scope::Decode, "the obvious thing to write gets the shape that works");
         assert!(covers(Scope::Decode, Stage::Decode) && !covers(Scope::Decode, Stage::Encode));
-        // off, in all the ways someone might write it
-        for off in ["", "0", "off", "no", "false", "OFF"] {
-            assert_eq!(scope_from(off), Scope::Off, "{off:?}");
-        }
         assert!(!covers(Scope::Off, Stage::Decode) && !covers(Scope::Off, Stage::Encode));
         // and encoders only on an explicit ask
-        for all in ["all", "both", "encode", "ALL"] {
-            assert_eq!(scope_from(all), Scope::All, "{all:?}");
-        }
         assert!(covers(Scope::All, Stage::Decode) && covers(Scope::All, Stage::Encode));
-        // anything else is the safe shape rather than an error: a typo in a unit file should not decide this
-        assert_eq!(scope_from("yes please"), Scope::Decode);
     }
 
     /// **A decoder and an encoder must never be given the same core.** They were: the first version counted decoders

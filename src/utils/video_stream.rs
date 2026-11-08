@@ -38,15 +38,21 @@ impl Backend {
     /// enough for one camera at 30 Hz, let alone two, and `avdec_h265` is nearly twice as quick. libde265 stays as the
     /// fallback because it needs only a shared library, and it is what a developer machine without GStreamer gets.
     ///
-    /// `ZDC_H265_BACKEND=libde265` forces the fallback, to compare them on one machine.
+    /// [`Settings::force_libde265`](crate::settings::Settings::force_libde265) forces the fallback, to compare them
+    /// on one machine.
     fn best() -> Result<Self> {
-        let forced = std::env::var("ZDC_H265_BACKEND").unwrap_or_default();
+        Self::best_with(crate::settings::settings().force_libde265)
+    }
+
+    /// [`Backend::best`] with the choice passed in, so a test can measure both on one machine without the settings
+    /// (which are fixed for a process once read).
+    fn best_with(forced: bool) -> Result<Self> {
         // every branch below says which decoder it picked and why. The two differ by nearly twice in speed (~83 fps of
-        // 720p against ~50 on an RK3588 core), and a stale `ZDC_H265_BACKEND` in some unit file quietly costing that
+        // 720p against ~50 on an RK3588 core), and a stale `force_libde265` left in a config quietly costing that
         // much is exactly the kind of thing that gets blamed on the hardware for an afternoon.
         #[cfg(feature = "gstreamer")]
-        let why = if forced == "libde265" {
-            " (ZDC_H265_BACKEND asks for it; GStreamer's is faster where it is installed)".to_owned()
+        let why = if forced {
+            " (force_libde265 asks for it; GStreamer's is faster where it is installed)".to_owned()
         } else {
             match crate::encoders::gstreamer::H265Decoder::new() {
                 Ok(decoder) => {
@@ -343,11 +349,9 @@ mod tests {
     fn every_backend_decodes_the_real_stream_at_the_same_size() {
         let (keyframe, predicted) = capture();
         let mut any = false;
-        for forced in ["", "libde265"] {
-            // SAFETY: single-threaded test, and the variable is only read when a backend is made
-            unsafe { std::env::set_var("ZDC_H265_BACKEND", forced) };
-            let Ok(mut backend) = Backend::best() else {
-                eprintln!("no backend for ZDC_H265_BACKEND={forced:?}: skipping");
+        for forced in [false, true] {
+            let Ok(mut backend) = Backend::best_with(forced) else {
+                eprintln!("no backend with force_libde265={forced}: skipping");
                 continue;
             };
             let name = match &backend {
@@ -382,8 +386,6 @@ mod tests {
             eprintln!("{name}: {pictures} pictures of 1280x720 in {:.0} ms = {:.0} fps", elapsed * 1000.0, pictures as f64 / elapsed);
             any = true;
         }
-        // SAFETY: as above
-        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
         assert!(any, "no H.265 decoder at all on this machine");
     }
 
@@ -465,8 +467,6 @@ mod tests {
             eprintln!("skipping: no GStreamer H.265 decoder");
             return;
         }
-        // SAFETY: the variable is read only when a backend is made, and this asks for the default one
-        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
         let (keyframe, predicted) = capture();
         let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         let mut units = vec![keyframe];
@@ -491,8 +491,6 @@ mod tests {
             eprintln!("skipping: no GStreamer H.265 decoder");
             return;
         }
-        // SAFETY: single-threaded test, and the variable is read only when a backend is made
-        unsafe { std::env::remove_var("ZDC_H265_BACKEND") };
         let (keyframe, predicted) = capture();
         let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         decoder.hold(0);

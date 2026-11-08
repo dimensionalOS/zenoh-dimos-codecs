@@ -259,7 +259,7 @@ mod tests {
     }
 }
 
-/// How many worker threads a [`Stream`] decoder gets, unless `ZDC_H265_THREADS` says otherwise. HEVC at 720p30 is more
+/// How many worker threads a [`Stream`] decoder gets, unless the settings say otherwise. HEVC at 720p30 is more
 /// than one core can hold, and a context's workers are internal to it, so they do not disturb the order access units are
 /// fed in. Capped low because every camera has its own decoder.
 /// Measured on one 720p capture from the robot (13th-gen i7, release): 1 thread 99 fps, 2 threads 151, 4 threads 192.
@@ -267,11 +267,11 @@ mod tests {
 /// and leave the encoders nothing. Where this is not enough the answer is a hardware decoder, not more threads.
 const DEFAULT_WORKER_THREADS: usize = 2;
 
-/// Worker threads per decoder: `ZDC_H265_THREADS`, else [`DEFAULT_WORKER_THREADS`], never more than this machine has.
+/// Worker threads per decoder: [`Settings::h265_threads`](crate::settings::Settings::h265_threads), never more than
+/// this machine has.
 fn worker_threads() -> usize {
     let available = std::thread::available_parallelism().map_or(1, |count| count.get());
-    let wanted = std::env::var("ZDC_H265_THREADS").ok().and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_WORKER_THREADS);
-    wanted.clamp(1, available.max(1))
+    crate::settings::settings().h265_threads.clamp(1, available.max(1))
 }
 
 /// A decoder that keeps its state between access units, so **predicted frames decode**.

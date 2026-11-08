@@ -32,6 +32,9 @@ pub mod encoders;
 /// JPEG decoding on the Jetson's hardware decoder, in a child process (feature `gstreamer`), for the video path.
 #[cfg(feature = "gstreamer")]
 pub mod hardware_jpeg;
+
+/// What a deployment chooses about how video is decoded and encoded.
+pub mod settings;
 /// What the codecs share: wire readers (CDR, LCM), image decoders (JPEG, PNG, WebP, JPEG XL, raw pixels), and the
 /// depth and point-cloud encodings.
 pub mod utils;

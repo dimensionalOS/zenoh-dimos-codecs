@@ -3,7 +3,7 @@ name = "zenoh-dimos-codecs"
 version = "0.3.13"
 edition = "2024"
 rust-version = "1.88"
-description = "zenoh-gateway codecs for ROS 2 and dimos images, compressed video (H.264, H.265), depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
+description = "zenoh-gateway codecs for ROS 2 and dimos images, compressed video (H.264, H.265, AV1), depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
 repository = "https://github.com/dimensionalOS/zenoh-dimos-codecs"
 license-file = "LICENSE"
 readme = "README.md"
@@ -17,12 +17,15 @@ videotoolbox = []
 # encoders: GStreamer's hardware H.264 encoders, loaded at runtime (dlopen, so building needs no GStreamer): nvv4l2h264enc
 # (Jetson), nvh264enc (NVENC), vah264enc / vaapih264enc (VAAPI)
 gstreamer = []
+# AV1 decoding with dav1d's hand-written assembly (4-8x the pure-Rust fallback). x86 needs nasm to build it; aarch64
+# assembles with the C compiler already in use, so it is free there
+av1-asm = ["rav1d/asm"]
 # JPEG decoding with libjpeg-turbo (vendored C, built by cmake and linked statically; x86 needs nasm too) instead of
 # zune-jpeg: the video path gets the JPEG's own YCbCr planes, with no chroma upsampling to undo
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
-zenoh-gateway = "0.5.37"
+zenoh-gateway = "0.6"
 anyhow = "1"
 # encodeOptions
 serde_json = "1"
@@ -40,6 +43,10 @@ log = "0.4"
 libloading = "0.9"
 # H.264 compressed video (the C sources zenoh-gateway's encoder builds anyway)
 openh264 = "0.9"
+# AV1 compressed video: rav1d, the pure-Rust port of dav1d, so no system library and no C toolchain (unlike libde265
+# for H.265). Feature `av1-asm` adds dav1d's own hand-written assembly; it is off here because on x86 rav1d's build
+# shells out to nasm, and a decoder should not make a build tool mandatory. Turn it on wherever decode speed matters.
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
 
 # (it drives the Jetson's encoder: `cargo test` elsewhere skips it instead of failing to build)
 [[example]]
@@ -52,7 +59,7 @@ libc = "0.2"
 
 [dev-dependencies]
 # tests/h265_passthrough runs the Rust client against an in-process server
-zenoh-gateway = { version = "0.5.37", features = ["client"] }
+zenoh-gateway = { version = "0.6", features = ["client"] }
 tokio = { version = "1", features = ["full"] }
 env_logger = "0.11"
 
@@ -60,4 +67,4 @@ env_logger = "0.11"
 # zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
 zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }
 # local H.265 passthrough work, not published: build against the sibling worktree
-zenoh-gateway = { path = "../gateway/gateway" }
+zenoh-gateway = { path = "../zenoh-gateway/gateway" }

@@ -1,6 +1,8 @@
 //! What the message codecs share: the two wire readers, the image decoders, raw audio, and the depth and point-cloud
 //! encodings.
 
+pub mod av1;
+pub mod av1_seq;
 pub mod cdr;
 pub mod compressed_image;
 pub mod compressed_video;

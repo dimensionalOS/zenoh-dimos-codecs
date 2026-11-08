@@ -1,14 +1,14 @@
 # zenoh-dimos-codecs
 
-[zenoh-gateway](https://github.com/jeff-hykin/zenoh-gateway) codecs for ROS 2 (rmw_zenoh) and dimos sensor
+[zenoh-gateway](https://github.com/dimensionalOS/zenoh-gateway) codecs for ROS 2 (rmw_zenoh) and dimos sensor
 messages: images as H.264 video, lossless depth and quantized point clouds, plus hardware H.264 encoders
 (see [Hardware encoders](#hardware-encoders)). A Rust crate of `zenoh_gateway::MessageEncoding`s and encoders: depth and point clouds are zenoh-gateway **fields**, which
 zenoh-gateway's own browser client decodes, so pages need no code from here. The `zenoh-gateway` command
-([zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli)) has them all.
+([zenoh-gateway-cli](https://github.com/dimensionalOS/zenoh-gateway-cli)) has them all.
 
 ```toml
 [dependencies]
-zenoh-dimos-codecs = { git = "https://github.com/jeff-hykin/zenoh-dimos-codecs", rev = "<commit>" }
+zenoh-dimos-codecs = { git = "https://github.com/dimensionalOS/zenoh-dimos-codecs", rev = "<commit>" }
 ```
 
 ```rust
@@ -19,7 +19,7 @@ for codec in zenoh_dimos_codecs::all() {
 ```
 
 ```js
-import { connect } from "https://esm.sh/gh/jeff-hykin/zenoh-gateway@<commit>/client/zenoh_gateway.ts"
+import { connect } from "./zenoh_gateway.js" // zenoh-gateway's client/zenoh_gateway.ts, bundled or vendored (see its SPEC.md, "Client")
 const z = await connect("http://robot.local:7448")
 z.encodings   // [{ name: "dimos_lcm_depth", output: "fields" }, { name: "dimos_lcm_image", output: "video" }, ...]
 z.subscribe("dimos/camera/depth/sensor_msgs.Image", { encoding: "dimos_lcm_depth" }, (msg) => draw(msg.decoded))
@@ -92,7 +92,7 @@ u8 over the message's min..max (`intensityMin`, `intensityScale`). `positions` i
 ## Hardware encoders
 
 `zenoh_dimos_codecs::encoders`: hardware H.264 encoders as zenoh-gateway `VideoEncoder`s for
-`ServerBuilder::video_encoder` (formerly the zenoh-web-encoders crate). [zenoh-gateway-cli](https://github.com/jeff-hykin/zenoh-gateway-cli)
+`ServerBuilder::video_encoder` (formerly the zenoh-web-encoders crate). [zenoh-gateway-cli](https://github.com/dimensionalOS/zenoh-gateway-cli)
 and [zenoh-gateway-relay](https://github.com/jeff-hykin/zenoh-gateway-relay) use them (`--video-encoder auto|software|videotoolbox|gstreamer`).
 
 | feature | backend | needs |
@@ -101,7 +101,7 @@ and [zenoh-gateway-relay](https://github.com/jeff-hykin/zenoh-gateway-relay) use
 | `gstreamer` | the first GStreamer hardware encoder that works: `nvv4l2h264enc` (Jetson), `nvh264enc` (NVENC), `vah264enc` / `vaapih264enc` (VAAPI) | GStreamer 1.x at runtime only: it is loaded with `dlopen`, so building needs nothing and a machine without it falls back to software |
 
 ```toml
-zenoh-dimos-codecs = { git = "https://github.com/jeff-hykin/zenoh-dimos-codecs", rev = "<commit>", features = ["videotoolbox", "gstreamer"] }
+zenoh-dimos-codecs = { git = "https://github.com/dimensionalOS/zenoh-dimos-codecs", rev = "<commit>", features = ["videotoolbox", "gstreamer"] }
 ```
 
 ```rust
@@ -148,7 +148,7 @@ lists the codecs, starts and stops a loopback server with them, then selects an 
 pattern. Built with zenoh-gateway's `lib.crossRust`: crate2nix, one derivation per crate shared with the other zenoh-gateway
 flakes, Linux cross compiled with zig (glibc 2.35). GStreamer is opened at runtime, so the Linux builds need no
 GStreamer and the feature is always compiled in. Pass `--max-jobs auto`. After changing `nix_smoke_test/Cargo.lock`,
-`nix run github:jeff-hykin/zenoh-gateway#crate2nix -- generate` in `nix_smoke_test/`. To build your own crate that uses this one,
+`nix run github:dimensionalOS/zenoh-gateway#crate2nix -- generate` in `nix_smoke_test/`. To build your own crate that uses this one,
 see zenoh-gateway's README "Nix / cross compiling".
 
 ## Tests

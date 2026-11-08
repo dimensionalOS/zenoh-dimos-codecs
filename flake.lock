@@ -50,13 +50,13 @@
       "locked": {
         "lastModified": 1791331731,
         "narHash": "sha256-6Qy71p/1E822McTwmoc+TuAnE9vh5U9ABqneCsJmgIA=",
-        "owner": "jeff-hykin",
+        "owner": "dimensionalOS",
         "repo": "zenoh-gateway",
         "rev": "28c17f08b3afcac56ede2f29816b89b427c4aba0",
         "type": "github"
       },
       "original": {
-        "owner": "jeff-hykin",
+        "owner": "dimensionalOS",
         "repo": "zenoh-gateway",
         "type": "github"
       }

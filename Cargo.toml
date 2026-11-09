@@ -25,7 +25,7 @@ av1-asm = ["rav1d/asm"]
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
-zenoh-gateway = "0.6"
+zenoh-gateway = "0.5"
 anyhow = "1"
 # encodeOptions
 serde_json = "1"
@@ -59,7 +59,7 @@ libc = "0.2"
 
 [dev-dependencies]
 # tests/h265_passthrough runs the Rust client against an in-process server
-zenoh-gateway = { version = "0.6", features = ["client"] }
+zenoh-gateway = { version = "0.5", features = ["client"] }
 tokio = { version = "1", features = ["full"] }
 env_logger = "0.11"
 
@@ -68,8 +68,11 @@ env_logger = "0.11"
 # the tag must match what zenoh-gateway pins (`zenoh = "=1.10.1"`): a patch cargo cannot satisfy is ignored with only a
 # warning, which is how this came to be building against unpatched zenoh after the gateway moved from 1.6.2 to 1.10.1
 zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.1-patch.1" }
-# The passthrough work is on zenoh-gateway main (0.6.8) and not published: crates.io tops out at 0.6.7, which does not
-# have the API this needs, and there are no publish credentials on the machines this is built on.
+# The passthrough work is in zenoh-gateway v0.5.39 and not published: crates.io tops out at 0.6.7, which does not
+# have the API this needs, and there are no publish credentials on the machines this is built on. v0.5.39 is the 0.6
+# line renumbered onto 0.5 (0.6 was never a statement about the app-facing API), which is why the requirements above
+# read "0.5": a patch cargo cannot satisfy is ignored with only a warning, so leaving them at "0.6" would quietly
+# build the registry 0.6.7 that lacks the API.
 #
 # A **git rev**, not a path: a path patch only resolves on a machine that happens to have the sibling checkout at
 # exactly that relative spot, so the branch was unbuildable for anyone else and a build could silently compile a
@@ -77,4 +80,5 @@ zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.
 # public. Bumped on purpose rather than tracking `main`, because a floating branch leaves the lockfile as the only
 # record of what was built — and the two patches that have already gone silently inert here were both the manifest
 # saying one thing and the build doing another. `tests/patches_are_used.rs` fails if this stops applying.
-zenoh-gateway = { git = "https://github.com/dimensionalOS/zenoh-gateway", rev = "86b2fe53034616dbd91e80eb30e1545a17faa158" }
+# v0.5.39 is ce46eb4.
+zenoh-gateway = { git = "https://github.com/dimensionalOS/zenoh-gateway", rev = "ce46eb4c5f5e62c4ea1c2ad19ec0d90cfb9d0df0" }

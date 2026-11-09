@@ -5531,8 +5531,8 @@ dependencies = [
 
 [[package]]
 name = "zenoh-gateway"
-version = "0.6.8"
-source = "git+https://github.com/dimensionalOS/zenoh-gateway?rev=86b2fe53034616dbd91e80eb30e1545a17faa158#86b2fe53034616dbd91e80eb30e1545a17faa158"
+version = "0.5.39"
+source = "git+https://github.com/dimensionalOS/zenoh-gateway?rev=ce46eb4c5f5e62c4ea1c2ad19ec0d90cfb9d0df0#ce46eb4c5f5e62c4ea1c2ad19ec0d90cfb9d0df0"
 dependencies = [
  "anyhow",
  "async-trait",

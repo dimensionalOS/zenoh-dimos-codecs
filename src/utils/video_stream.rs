@@ -71,24 +71,70 @@ struct Timings {
     decode: Duration,
     /// wrapping the picture with its message header
     wrap: Duration,
+    /// when this window began, so the real interval between samples can be compared with the work done per sample
+    started: Option<Instant>,
 }
 
 impl Timings {
+    fn each(&self, part: Duration) -> f64 {
+        part.as_secs_f64() * 1000.0 / self.samples.max(1) as f64
+    }
+
     fn line(&self) -> String {
-        let each = |part: Duration| part.as_secs_f64() * 1000.0 / self.samples.max(1) as f64;
         format!(
             "{} samples, each: parse {:.2}, prepare {:.2}, decode {:.2}, wrap {:.2} ms",
             self.samples,
-            each(self.parse),
-            each(self.prepare),
-            each(self.decode),
-            each(self.wrap)
+            self.each(self.parse),
+            self.each(self.prepare),
+            self.each(self.decode),
+            self.each(self.wrap)
         )
+    }
+
+    /// Everything this thread spent on a sample, which is what has to fit between two of them.
+    fn work(&self) -> Duration {
+        self.parse + self.prepare + self.decode + self.wrap
+    }
+
+    /// The mean time between the samples of this window, ms — the publisher's real rate rather than a configured one,
+    /// which is the figure the work actually has to fit inside. `None` until two samples have arrived.
+    fn interval(&self) -> Option<f64> {
+        let started = self.started?;
+        (self.samples > 1).then(|| started.elapsed().as_secs_f64() * 1000.0 / (self.samples - 1) as f64)
+    }
+
+    /// Why this transcode is too slow, if it is: the work per sample against the time between samples.
+    ///
+    /// Measured, not configured. A stream that cannot keep up does not fail cleanly — it fills its queue, drops a
+    /// sample, resyncs, and shows a second of nothing per gap — so the frame rate is the only symptom and it looks
+    /// like a network problem. Naming the stage that dominates is what makes the line actionable: a slow decode wants
+    /// a different decoder (or hardware), while a slow `prepare` would mean something pathological in the bitstream.
+    fn too_slow(&self, source: VideoFormat, target: VideoFormat) -> Option<String> {
+        let interval = self.interval()?;
+        let work = self.each(self.work());
+        if work < interval * SLOW_AT {
+            return None;
+        }
+        let worst = [("decode", self.decode), ("prepare", self.prepare), ("parse", self.parse), ("wrap", self.wrap)]
+            .into_iter()
+            .max_by(|(_, a), (_, b)| a.cmp(b))
+            .map(|(name, part)| format!("{name} {:.1} ms", self.each(part)))
+            .unwrap_or_default();
+        Some(format!(
+            "transcoding {source:?} to {target:?} takes {work:.1} ms a frame against {interval:.1} ms between them ({worst}):              this stream cannot keep up, so it will drop samples and lose about a second of pictures to each resync"
+        ))
     }
 }
 
 /// Samples between timing lines: ~5 s at 30 Hz, matching the decoder's own.
 const STREAM_REPORT: u64 = 150;
+
+/// The fraction of the time between samples the work may take before it is worth warning about.
+///
+/// Not 1.0: at parity the stream is already dropping, and a warning that arrives with the blackouts is a description
+/// rather than a warning. Below this there is headroom for the encode stage, which runs after this one and is not
+/// counted here.
+const SLOW_AT: f64 = 0.8;
 
 /// Headers kept waiting for their picture. The decoder holds one frame, so two is the working depth; the rest is slack
 /// for a unit that completes no picture, whose header is dropped when a later one's picture comes out.
@@ -125,12 +171,18 @@ impl StreamDecoder for CompressedVideoStream {
         let part = Instant::now();
         let message = (self.parse)(sample.payload)?;
         self.timings.samples += 1;
+        self.timings.started.get_or_insert(part);
         self.timings.parse += part.elapsed();
+        let source = bitstream::by_name(&message.format)?;
+        // Closed here rather than before the format was read, so the line can name the pair being transcoded. The
+        // window being reported is the previous one plus this sample's parse, which on a 150-sample window is noise.
         if self.timings.samples >= STREAM_REPORT {
             log::info!("video stream {}", self.timings.line());
+            if let Some(why) = self.timings.too_slow(source.format(), self.target) {
+                log::warn!("{why}");
+            }
             self.timings = Timings::default();
         }
-        let source = bitstream::by_name(&message.format)?;
         let unit = source.unit(message.data)?;
         // the track wants exactly what the publisher sent, so the coded unit goes to the browser as it is, predicted
         // frames and all: no decode, no re-encode, and the receiver's own decoder keeps the reference chain. The track's
@@ -435,10 +487,55 @@ mod tests {
             prepare: Duration::from_millis(7),
             decode: Duration::from_millis(56),
             wrap: Duration::from_micros(300),
+            started: None,
         };
         assert_eq!(timings.line(), "100 samples, each: parse 0.00, prepare 0.07, decode 0.56, wrap 0.00 ms");
         // nothing measured yet says so rather than dividing by it
         assert!(!Timings::default().line().contains("NaN"), "{}", Timings::default().line());
+    }
+
+    /// One window's worth of timings whose work took `work_ms` a sample, over a window `span` long.
+    fn window(samples: u64, work_ms: u64, decode_share: u64, span: Duration) -> Timings {
+        Timings {
+            samples,
+            parse: Duration::ZERO,
+            prepare: Duration::from_millis((work_ms - decode_share) * samples),
+            decode: Duration::from_millis(decode_share * samples),
+            wrap: Duration::ZERO,
+            // the window began `span` ago
+            started: Some(Instant::now() - span),
+        }
+    }
+
+    /// A transcode that cannot keep up has no clean failure — it fills its queue, drops a sample, resyncs, and loses
+    /// about a second of pictures per gap — so the only symptom is the frame rate and it reads as a network problem.
+    /// The warning is the thing that says otherwise, so what it fires on and what it says both matter.
+    #[test]
+    fn a_transcode_that_cannot_keep_up_says_so_and_names_the_stage() {
+        // 150 samples over 5 s is 33.5 ms apart; 30 ms of work a sample is 90% of that
+        let slow = window(150, 30, 28, Duration::from_secs(5));
+        let why = slow.too_slow(VideoFormat::H265, VideoFormat::H264).expect("30 ms of work in a 33 ms interval");
+        assert!(why.contains("H265") && why.contains("H264"), "it names the pair: {why}");
+        assert!(why.contains("decode 28"), "and the stage that dominates: {why}");
+        assert!(why.contains("cannot keep up"), "{why}");
+
+        // the same work at half the rate has room for it, and says nothing
+        let roomy = window(150, 30, 28, Duration::from_secs(10));
+        assert!(roomy.too_slow(VideoFormat::H265, VideoFormat::H264).is_none(), "67 ms between samples is room for 30");
+
+        // a forwarded stream does no work worth naming, whatever its rate
+        let forwarded = window(150, 1, 0, Duration::from_secs(5));
+        assert!(forwarded.too_slow(VideoFormat::H264, VideoFormat::H264).is_none());
+    }
+
+    /// It must not warn on what it cannot know yet: one sample gives no interval to compare against, and dividing by
+    /// zero samples would make the first line of every stream a warning.
+    #[test]
+    fn nothing_is_said_about_a_rate_not_yet_measured() {
+        assert!(Timings::default().too_slow(VideoFormat::H265, VideoFormat::H264).is_none(), "no samples");
+        let one = window(1, 500, 500, Duration::from_secs(1));
+        assert!(one.too_slow(VideoFormat::H265, VideoFormat::H264).is_none(), "one sample is no interval");
+        assert_eq!(Timings::default().interval(), None);
     }
 
     #[test]

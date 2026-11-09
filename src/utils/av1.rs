@@ -1,6 +1,6 @@
 //! AV1: reading a temporal unit's OBUs, and decoding one with rav1d.
 //!
-//! AV1 has no Annex-B start codes to scan for ([`compressed_video::nal_units`](super::compressed_video::nal_units));
+//! AV1 has no Annex-B start codes to scan for ([`bitstream::nal_units`](super::bitstream::nal_units));
 //! a temporal unit is a run of OBUs that each carry their own size (the low-overhead bitstream format, spec 5.2), so
 //! reading one is exact rather than a search. The sequence header OBU plays the part H.264's SPS/PPS play: only it says
 //! how big the picture is, and a decoder can start only once it has one.

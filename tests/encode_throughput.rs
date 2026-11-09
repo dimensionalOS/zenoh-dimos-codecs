@@ -14,7 +14,7 @@
 use std::time::Instant;
 use zenoh_gateway::{DecodedFrame, VideoEncoder, VideoImage, VideoTarget};
 use zenoh_gateway::H264Encoder;
-use zenoh_dimos_codecs::utils::compressed_video::{Codec, nal_units};
+use zenoh_dimos_codecs::utils::bitstream::{Annex, nal_units};
 use zenoh_dimos_codecs::utils::h265;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -30,7 +30,7 @@ fn pictures() -> Vec<VideoImage> {
     };
     let keyframe = fixture("compressed/m20_front_keyframe.h265");
     let mut sets = Vec::new();
-    for (kind, unit) in nal_units(Codec::H265, &keyframe) {
+    for (kind, unit) in nal_units(Annex::H265, &keyframe) {
         if (32..=34).contains(&kind) {
             sets.extend_from_slice(&[0, 0, 0, 1]);
             sets.extend_from_slice(unit);
@@ -41,7 +41,7 @@ fn pictures() -> Vec<VideoImage> {
         pictures.push(first);
     }
     let capture = fixture("compressed/m20_front_2s.h265");
-    for (kind, unit) in nal_units(Codec::H265, &capture) {
+    for (kind, unit) in nal_units(Annex::H265, &capture) {
         let keyframe = (16..=21).contains(&kind);
         let mut access_unit = if keyframe { sets.clone() } else { Vec::new() };
         access_unit.extend_from_slice(&[0, 0, 0, 1]);

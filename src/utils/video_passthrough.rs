@@ -17,17 +17,9 @@
 //! ([`VideoFormat::passthrough_only`]) and neither thins nor rescales such a stream; a viewer that needs a keyframe
 //! waits for the publisher's next one.
 
-use super::compressed_video::{AccessUnit, Codec};
+use super::bitstream::Unit;
 use anyhow::{Result, anyhow, ensure};
 use zenoh_gateway::{DecodedFrame, EncodedVideo, H264Encoder, VideoEncoder, VideoFormat, VideoTarget};
-
-/// The AU codec a passthrough format carries.
-fn codec_of(format: VideoFormat) -> Codec {
-    match format {
-        VideoFormat::H264 => Codec::H264,
-        _ => Codec::H265,
-    }
-}
 
 /// Forwards already-encoded H.264/H.265 access units ([`AccessUnit`], from a compressed-video encoding's
 /// [`decode`](zenoh_gateway::MessageEncoding::decode) on a video track whose format matches the source codec) to the
@@ -41,8 +33,8 @@ pub struct Passthrough {
     format: VideoFormat,
     /// the newest size any sequence parameter set gave: frames between keyframes carry none
     size: Option<(u32, u32)>,
-    /// the newest parameter sets seen, to put back in front of a keyframe that arrives without them
-    parameter_sets: Option<Vec<u8>>,
+    /// the newest headers seen (H.26x parameter sets, AV1's sequence header), to put back in front of a keyframe without them
+    headers: Option<Vec<u8>>,
 }
 
 /// The H.265 passthrough (the only format that is *always* passed through — there is no H.265 encoder here).
@@ -56,7 +48,7 @@ impl Default for Passthrough {
 
 impl Passthrough {
     pub fn new(format: VideoFormat) -> Self {
-        Passthrough { format, size: None, parameter_sets: None }
+        Passthrough { format, size: None, headers: None }
     }
 }
 
@@ -66,10 +58,10 @@ impl VideoEncoder for Passthrough {
     }
 
     fn encode(&mut self, frame: &DecodedFrame, _target: &VideoTarget) -> Result<Option<EncodedVideo>> {
-        let unit: &AccessUnit = frame.downcast().map_err(|error| anyhow!("the {:?} passthrough encoder takes access units: {error:#}", self.format))?;
-        ensure!(unit.codec == codec_of(self.format), "the {:?} passthrough encoder was handed {:?} data", self.format, unit.codec);
-        if let Some(sets) = &unit.parameter_sets {
-            self.parameter_sets = Some(sets.clone());
+        let unit: &Unit = frame.downcast().map_err(|error| anyhow!("the {:?} passthrough encoder takes access units: {error:#}", self.format))?;
+        ensure!(unit.format == self.format, "the {:?} passthrough encoder was handed {:?} data", self.format, unit.format);
+        if let Some(sets) = &unit.headers {
+            self.headers = Some(sets.clone());
         }
         if let Some(size) = unit.size {
             self.size = Some(size);
@@ -80,11 +72,11 @@ impl VideoEncoder for Passthrough {
             return Ok(None);
         };
         // a keyframe is only a keyframe to a browser that gets the parameter sets with it
-        let data = match (unit.keyframe, unit.parameter_sets.is_none(), &self.parameter_sets) {
+        let data = match (unit.keyframe, unit.headers.is_none(), &self.headers) {
             (true, true, Some(sets)) => [sets.as_slice(), unit.data.as_slice()].concat(),
             _ => unit.data.clone(),
         };
-        let keyframe = unit.keyframe && (unit.parameter_sets.is_some() || self.parameter_sets.is_some());
+        let keyframe = unit.keyframe && (unit.headers.is_some() || self.headers.is_some());
         Ok(Some(EncodedVideo { data, width, height, keyframe }))
     }
 }
@@ -145,32 +137,32 @@ impl VideoEncoder for H264Relay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::compressed_video::to_access_unit;
+    use crate::utils::bitstream::unit_of;
     use crate::utils::tests::fixture;
 
     /// A `DecodedFrame` holding `unit`, as a compressed-video encoding's `decode` returns on a `video-h265` channel.
-    fn frame(unit: AccessUnit) -> DecodedFrame {
+    fn frame(unit: Unit) -> DecodedFrame {
         DecodedFrame::data(unit)
     }
 
     #[test]
     fn forwards_a_keyframe_with_its_size_and_bytes_unchanged() {
         let data = fixture("compressed/pattern.h265");
-        let unit = to_access_unit(&data, "h265").unwrap();
+        let unit = unit_of("h265", &data).unwrap();
         let mut encoder = H265Passthrough::default();
         let encoded = encoder.encode(&frame(unit), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().expect("a frame");
         assert_eq!((encoded.width, encoded.height), (320, 240), "the size comes from the SPS, not the target");
         assert!(encoded.keyframe);
-        assert_eq!(encoded.data, to_access_unit(&data, "h265").unwrap().data, "the access unit goes out as it came in, start codes normalised");
+        assert_eq!(encoded.data, unit_of("h265", &data).unwrap().data, "the access unit goes out as it came in, start codes normalised");
     }
 
 
     #[test]
     fn a_predicted_frame_keeps_the_size_the_keyframe_gave() {
         let mut encoder = H265Passthrough::default();
-        encoder.encode(&frame(to_access_unit(&fixture("compressed/pattern.h265"), "h265").unwrap()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap();
+        encoder.encode(&frame(unit_of("h265", &fixture("compressed/pattern.h265")).unwrap()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap();
         // a bare TRAIL_R slice: no keyframe, no parameter sets, no size of its own
-        let predicted = to_access_unit(&[0, 0, 0, 1, 0x02, 0x01, 0xaa], "h265").unwrap();
+        let predicted = unit_of("h265", &[0, 0, 0, 1, 0x02, 0x01, 0xaa]).unwrap();
         assert_eq!(predicted.size, None);
         let encoded = encoder.encode(&frame(predicted), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().expect("a frame");
         assert_eq!((encoded.width, encoded.height), (320, 240));
@@ -180,20 +172,20 @@ mod tests {
     #[test]
     fn nothing_goes_out_before_a_parameter_set_says_how_big_the_picture_is() {
         let mut encoder = H265Passthrough::default();
-        let predicted = to_access_unit(&[0, 0, 0, 1, 0x02, 0x01, 0xaa], "h265").unwrap();
+        let predicted = unit_of("h265", &[0, 0, 0, 1, 0x02, 0x01, 0xaa]).unwrap();
         assert!(encoder.encode(&frame(predicted), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().is_none());
     }
 
     #[test]
-    fn puts_remembered_parameter_sets_back_in_front_of_a_bare_keyframe() {
+    fn puts_remembered_headers_back_in_front_of_a_bare_keyframe() {
         let with_sets = fixture("compressed/pattern.h265");
         let bare = fixture("compressed/pattern_bare.h265");
         let mut encoder = H265Passthrough::default();
-        encoder.encode(&frame(to_access_unit(&with_sets, "h265").unwrap()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap();
-        let unit = to_access_unit(&bare, "h265").unwrap();
-        assert_eq!(unit.parameter_sets, None, "the bare fixture carries none");
+        encoder.encode(&frame(unit_of("h265", &with_sets).unwrap()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap();
+        let unit = unit_of("h265", &bare).unwrap();
+        assert_eq!(unit.headers, None, "the bare fixture carries none");
         let encoded = encoder.encode(&frame(unit), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().expect("a frame");
-        let normalized = to_access_unit(&bare, "h265").unwrap().data;
+        let normalized = unit_of("h265", &bare).unwrap().data;
         assert!(encoded.keyframe, "it is a keyframe once the parameter sets are back");
         assert!(encoded.data.len() > normalized.len(), "the parameter sets were put in front");
         assert!(encoded.data.ends_with(&normalized), "and the keyframe itself follows them");
@@ -206,7 +198,7 @@ mod tests {
         let picture = DecodedFrame::Video(zenoh_gateway::VideoImage::rgb8(2, 2, vec![0; 12]).unwrap());
         let error = encoder.encode(&picture, &target).unwrap_err().to_string();
         assert!(error.contains("takes access units"), "{error}");
-        let h264 = to_access_unit(&fixture("compressed/pattern.h264"), "h264").unwrap();
+        let h264 = unit_of("h264", &fixture("compressed/pattern.h264")).unwrap();
         let error = encoder.encode(&frame(h264), &target).unwrap_err().to_string();
         assert!(error.contains("was handed H264 data"), "{error}");
     }
@@ -214,7 +206,7 @@ mod tests {
     #[test]
     fn h264_relay_forwards_an_h264_source_unchanged() {
         let data = fixture("compressed/pattern.h264");
-        let unit = to_access_unit(&data, "h264").unwrap();
+        let unit = unit_of("h264", &data).unwrap();
         let mut relay = H264Relay::new();
         let encoded = relay.encode(&frame(unit.clone()), &VideoTarget::new(64, 64, 100_000, 30.0)).unwrap().expect("a frame");
         assert_eq!((encoded.width, encoded.height), (320, 240), "the size comes from the H.264 SPS, not the target");

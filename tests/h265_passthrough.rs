@@ -164,14 +164,21 @@ async fn a_client_without_hevc_gets_every_frame_re_encoded() -> Result<()> {
     // the pictures are the camera's own size, decoded rather than read off an SPS
     let sized = info.iter().find(|frame| frame.source_width > 0).expect("metadata with a source size");
     assert_eq!((sized.source_width, sized.source_height), (1280, 720));
-    // Resyncs, but not a storm of them. A machine that cannot encode this picture at this rate *should* drop samples
-    // and resync - that is the stream degrading honestly, not a defect, and a debug build on a developer machine does
-    // exactly that once the picture is full size. What would be a defect is resyncing faster than frames arrive, which
-    // is what the read-ahead bug did. (This asserted zero until the grant ratchet was fixed, and passed only because
-    // the ratchet had shrunk the picture to something a slow build could keep up with - green for the wrong reason.)
+    // **Every resync must be explained by a lost sample.** A machine that cannot encode this picture at this rate
+    // *should* drop samples and resync - that is the stream degrading honestly, not a defect, and a debug build on a
+    // developer machine does exactly that once the picture is full size. So the bar cannot be a resync count: it would
+    // measure the machine, and this one failed in debug at 4 resyncs while release managed 0.
+    //
+    // What a defect looks like instead is a resync with no lost sample behind it, which is exactly what the read-ahead
+    // bug did: it consumed a sample off the queue itself, so the key_seq gap - and the resync - came without the queue
+    // ever reporting a drop. `droppedQueue` counts the samples the queue really lost, and one more is allowed for the
+    // resync a stream may take before `note_stream_decoded` stops the allocator thinning it. On a machine that keeps
+    // up this is stricter than the count it replaces (0 drops means at most 1 resync); on one that does not it still
+    // catches the bug, because the ratio of resyncs to drops is the machine-independent part.
     let stats = client.stats().await?;
-    let resyncs = stats["channels"].as_array().and_then(|channels| channels.first()).map(|channel| channel["stats"]["streamResyncs"].as_u64().unwrap_or(0)).unwrap_or(0);
-    assert!(resyncs as usize * 5 < frames, "the decoder started over {resyncs} times for {frames} frames; stats: {}", stats["channels"]);
+    let stat = |name: &str| stats["channels"].as_array().and_then(|channels| channels.first()).map(|channel| channel["stats"][name].as_u64().unwrap_or(0)).unwrap_or(0);
+    let (resyncs, dropped) = (stat("streamResyncs"), stat("droppedQueue"));
+    assert!(resyncs <= dropped + 1, "the decoder started over {resyncs} times for {dropped} lost samples: a resync with no sample behind it means something consumed one without dropping it; stats: {}", stats["channels"]);
 
     drop(camera);
     client.close().await;

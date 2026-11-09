@@ -5356,8 +5356,7 @@ dependencies = [
 [[package]]
 name = "zenoh"
 version = "1.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "453ba5d28a1197653aae4bb024fd74a9d5c7051d5a19a77f3a43d83f40c22584"
+source = "git+https://github.com/jeff-hykin/zenoh-vendor?tag=zenoh-1.10.1-patch.1#fdd0474f80495f0dc43f039216b9befdbe759381"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -6191,8 +6190,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "zenoh"
-version = "1.6.2"
-source = "git+https://github.com/jeff-hykin/zenoh-vendor?tag=zenoh-1.6.2-patch.1#3148154ba096252497a9c564375e0d4c8bf7b6e9"

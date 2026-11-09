@@ -64,7 +64,9 @@ tokio = { version = "1", features = ["full"] }
 env_logger = "0.11"
 
 [patch.crates-io]
-# zenoh 1.6.2 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
-zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.6.2-patch.1" }
+# zenoh 1.10.1 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
+# the tag must match what zenoh-gateway pins (`zenoh = "=1.10.1"`): a patch cargo cannot satisfy is ignored with only a
+# warning, which is how this came to be building against unpatched zenoh after the gateway moved from 1.6.2 to 1.10.1
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.1-patch.1" }
 # local H.265 passthrough work, not published: build against the sibling worktree
 zenoh-gateway = { path = "../zenoh-gateway/gateway" }

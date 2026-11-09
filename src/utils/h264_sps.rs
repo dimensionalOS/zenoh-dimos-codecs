@@ -1,7 +1,7 @@
 //! The picture size in an H.264 sequence parameter set (NAL unit type 7).
 //!
 //! The H.264 twin of [`h265_sps`](super::h265_sps): a passed-through access unit
-//! ([`compressed_video::to_access_unit`](super::compressed_video::to_access_unit)) is never decoded here, so the
+//! ([`bitstream::Bitstream::unit`](super::bitstream::Bitstream::unit)) is never decoded here, so the
 //! gateway reads the picture size off the SPS that every keyframe carries in front of it. Only as much of the SPS as
 //! the size needs is parsed (up to `frame_cropping`), reusing the RBSP bit reader from `h265_sps`.
 

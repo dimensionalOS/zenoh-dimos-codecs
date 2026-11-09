@@ -2,10 +2,8 @@
 //! parameter sets) to a picture for the video encoder.
 
 use super::CompressedVideo;
-use crate::utils::{compressed_video, lcm::Lcm};
+use crate::utils::{lcm::Lcm, video};
 use anyhow::Result;
-use crate::utils::video_passthrough::{H264Relay, Passthrough};
-use crate::utils::video_stream::CompressedVideoStream;
 use zenoh_gateway::{Channel, DecodedFrame, EncodingOutput, EncodingSample, MessageEncoding, StreamDecoder, VideoEncoder, VideoFormat};
 
 /// The LCM fingerprint of dimos-lcm's type, as `lcm-gen` computes it.
@@ -41,34 +39,19 @@ impl MessageEncoding for DimosLcmCompressedVideo {
     }
 
     fn decode(&self, sample: &EncodingSample<'_>, channel: Channel) -> Result<DecodedFrame> {
-        let message = parse(sample.payload)?;
-        // on a passthrough channel the access unit goes to the browser as it is, predicted frames and all
-        if compressed_video::passes_through(channel) {
-            return Ok(DecodedFrame::data(compressed_video::to_access_unit(message.data, &message.format)?));
-        }
-        Ok(DecodedFrame::Video(message.header.add_to_video(compressed_video::to_video(message.data, &message.format)?)))
+        video::decode(parse, sample, channel)
     }
 
-    /// H.265 straight to the browser, which decodes it in hardware: no decode and re-encode here, so predicted frames
-    /// play too (`video-h265`; only Chrome and Safari offer it, see the client's `playableChannel`).
+    /// A track whose format the publisher already sends is forwarded, so predicted frames play and nothing is
+    /// transcoded; any other track is decoded and encoded again. See [`video`](crate::utils::video).
     fn video_encoder(&self, format: VideoFormat) -> Option<Box<dyn VideoEncoder>> {
-        match format {
-            // H.265 is only ever passed through (no H.265 encoder here)
-            VideoFormat::H265 => Some(Box::new(Passthrough::new(VideoFormat::H265)) as Box<dyn VideoEncoder>),
-            // H.264 forwards an H.264 source unchanged, else encodes a decoded (H.265) picture with openh264
-            VideoFormat::H264 => Some(Box::new(H264Relay::new()) as Box<dyn VideoEncoder>),
-            _ => None,
-        }
+        video::video_encoder(format)
     }
 
-    /// Anywhere the stream is decoded rather than passed through, one decoder keeps its state so predicted frames
-    /// decode too — without it only keyframes play, about one a second. A passthrough channel needs none: the browser's
-    /// own decoder keeps the state there.
+    /// One decoder per stream, so predicted frames play (without it only keyframes do, about one a second) and so the
+    /// gateway stops thinning a stream whose frames predict from each other.
     fn stream_decoder(&self, channel: Channel) -> Option<Box<dyn StreamDecoder>> {
-        // a passthrough-only format (H.265) keeps its state in the browser's own decoder, so no stream decoder here.
-        // Any other video format gets one: it forwards an already-matching source (H.264 → H.264) or decodes (H.265 → picture).
-        let Channel::Video(format) = channel else { return None };
-        (!format.passthrough_only()).then(|| Box::new(CompressedVideoStream::new(parse, format)) as Box<dyn StreamDecoder>)
+        video::stream_decoder(parse, channel)
     }
 }
 
@@ -84,11 +67,17 @@ mod tests {
         assert_eq!((video.format.as_str(), video.data), ("h265", fixture("compressed/pattern.h265").as_slice()));
     }
 
+    /// The per-sample path decodes an H.264 keyframe when the track is **not** H.264 — on an H.264 track the same
+    /// sample is forwarded instead, which is the pair rule and is what makes the decode here the thing under test.
     #[test]
-    fn h264_keyframes_decode() {
+    fn h264_keyframes_decode_for_a_track_they_cannot_be_forwarded_to() {
         let payload = fixture("dimos/compressed_video_h264.bin");
         let encoding = zenoh_gateway::zenoh::bytes::Encoding::default();
-        let DecodedFrame::Video(image) = DimosLcmCompressedVideo.decode(&EncodingSample::new("k", &payload, &encoding), Channel::Video(zenoh_gateway::VideoFormat::H264)).unwrap() else { panic!("video expected") };
+        let sample = EncodingSample::new("k", &payload, &encoding);
+        let DecodedFrame::Video(image) = DimosLcmCompressedVideo.decode(&sample, Channel::Video(VideoFormat::Vp8)).unwrap() else { panic!("video expected") };
         crate::utils::compressed_video::tests::assert_like_pattern(&image, "dimos h264");
+        // and on its own format it is handed over whole, not decoded
+        let forwarded = DimosLcmCompressedVideo.decode(&sample, Channel::Video(VideoFormat::H264)).unwrap();
+        assert!(matches!(forwarded, DecodedFrame::Data(_)), "an H.264 source on an H.264 track is forwarded");
     }
 }

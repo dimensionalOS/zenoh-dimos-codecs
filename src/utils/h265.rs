@@ -183,7 +183,7 @@ mod tests {
     fn m20_parameter_sets() -> Vec<u8> {
         let au = fixture("compressed/m20_front_keyframe.h265");
         let mut sets = Vec::new();
-        for (kind, unit) in crate::utils::compressed_video::nal_units(crate::utils::compressed_video::Codec::H265, &au) {
+        for (kind, unit) in crate::utils::bitstream::nal_units(crate::utils::bitstream::Annex::H265, &au) {
             if (32..=34).contains(&kind) {
                 sets.extend_from_slice(&[0, 0, 0, 1]);
                 sets.extend_from_slice(unit);
@@ -205,7 +205,7 @@ mod tests {
         }
         let sets = m20_parameter_sets();
         let capture = fixture("compressed/m20_front_2s.h265");
-        let units = crate::utils::compressed_video::nal_units(crate::utils::compressed_video::Codec::H265, &capture);
+        let units = crate::utils::bitstream::nal_units(crate::utils::bitstream::Annex::H265, &capture);
         let mut stream = Stream::new().unwrap();
         let (mut pictures, mut predicted) = (0, 0);
         let started = std::time::Instant::now();
@@ -235,7 +235,7 @@ mod tests {
         assert!(stream.push(&[0, 0, 0, 1, 0x02, 0x01, 0xaa], false).unwrap().is_none(), "no picture before a keyframe");
         let sets = m20_parameter_sets();
         let capture = fixture("compressed/m20_front_2s.h265");
-        let units = crate::utils::compressed_video::nal_units(crate::utils::compressed_video::Codec::H265, &capture);
+        let units = crate::utils::bitstream::nal_units(crate::utils::bitstream::Annex::H265, &capture);
         let (kind, first) = units.iter().find(|(kind, _)| (16..=21).contains(kind)).expect("a keyframe");
         let mut keyframe = sets.clone();
         keyframe.extend_from_slice(&[0, 0, 0, 1]);

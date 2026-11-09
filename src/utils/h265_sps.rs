@@ -1,6 +1,6 @@
 //! The picture size in an H.265 sequence parameter set.
 //!
-//! A passed-through access unit ([`compressed_video::to_access_unit`](super::compressed_video::to_access_unit)) is never
+//! A passed-through access unit ([`bitstream::Bitstream::unit`](super::bitstream::Bitstream::unit)) is never
 //! decoded, so nothing else knows how big its picture is: `foxglove_msgs/CompressedVideo` carries no size, and the
 //! gateway reads the size off each encoded frame (it sets the stream's source size, the allocator's grant and the
 //! per-frame metadata a page reads). So read it out of the SPS, which every keyframe carries in front of it.
@@ -143,12 +143,12 @@ pub fn picture_size(payload: &[u8]) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::compressed_video::{Codec, nal_units};
+    use crate::utils::bitstream::{Annex, nal_units};
     use crate::utils::tests::fixture;
 
     /// The SPS of an Annex-B access unit.
     fn sps(data: &[u8]) -> Vec<u8> {
-        nal_units(Codec::H265, data).into_iter().find(|(kind, _)| *kind == 33).expect("an SPS").1.to_vec()
+        nal_units(Annex::H265, data).into_iter().find(|(kind, _)| *kind == 33).expect("an SPS").1.to_vec()
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn reads_the_m20_camera_s_own_sequence_parameter_set() {
         let au = fixture("compressed/m20_front_keyframe.h265");
-        assert_eq!(nal_units(Codec::H265, &au).iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), vec![32, 33, 34, 19]);
+        assert_eq!(nal_units(Annex::H265, &au).iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), vec![32, 33, 34, 19]);
         assert_eq!(picture_size(&sps(&au)).unwrap(), (1280, 720));
     }
 
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn a_live_stream_is_mostly_predicted_frames_and_carries_no_parameter_sets() {
         let stream = fixture("compressed/m20_front_2s.h265");
-        let units = nal_units(Codec::H265, &stream);
+        let units = nal_units(Annex::H265, &stream);
         let kinds: std::collections::BTreeMap<u8, usize> = units.iter().fold(Default::default(), |mut counts, (kind, _)| {
             *counts.entry(*kind).or_default() += 1;
             counts

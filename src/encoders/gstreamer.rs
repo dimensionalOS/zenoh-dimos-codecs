@@ -830,7 +830,7 @@ pub fn decoder_pipelines() -> (u64, u64) {
 /// access unit of one stream, in order — so they sit behind one `StreamDecoder`.
 ///
 /// No parser in the pipeline: the access units handed in are already whole and carry their parameter sets
-/// ([`decodable`](crate::utils::compressed_video::decodable)), so `h265parse` would have nothing to do, and leaving it
+/// ([`decodable`](crate::utils::bitstream::decodable)), so `h265parse` would have nothing to do, and leaving it
 /// out means this works where `gstreamer1.0-plugins-bad` is not installed. The caps say `alignment=au` for that reason;
 /// `alignment=nal` is refused by the decoder.
 pub struct H265Decoder {

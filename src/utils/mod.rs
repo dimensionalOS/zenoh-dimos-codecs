@@ -3,6 +3,7 @@
 
 pub mod av1;
 pub mod av1_seq;
+pub mod bitstream;
 pub mod cdr;
 pub mod compressed_image;
 pub mod compressed_video;
@@ -18,6 +19,7 @@ pub mod pcm;
 pub mod png;
 pub mod pointcloud;
 pub mod raw_pixels;
+pub mod video;
 pub mod video_passthrough;
 pub mod video_stream;
 pub mod webp;

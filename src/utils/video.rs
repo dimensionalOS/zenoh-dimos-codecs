@@ -50,3 +50,17 @@ pub fn stream_decoder(parse: Parse, channel: Channel) -> Option<Box<dyn StreamDe
     let Channel::Video(track) = channel else { return None };
     Some(Box::new(CompressedVideoStream::new(parse, track)) as Box<dyn StreamDecoder>)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gateway's AV1 encoder has to be nameable from here, or an AV1 track cannot be served at all: forwarding an
+    /// AV1 source needs an encoder of this crate's own, and that encoder needs something to encode the frames it
+    /// cannot forward. This is the export that was missing.
+    #[test]
+    fn the_gateways_av1_encoder_is_reachable_from_here() {
+        use zenoh_gateway::{Av1Encoder, VideoEncoder};
+        assert_eq!(Av1Encoder::default().format(), VideoFormat::Av1);
+    }
+}

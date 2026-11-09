@@ -77,4 +77,4 @@ zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.
 # public. Bumped on purpose rather than tracking `main`, because a floating branch leaves the lockfile as the only
 # record of what was built — and the two patches that have already gone silently inert here were both the manifest
 # saying one thing and the build doing another. `tests/patches_are_used.rs` fails if this stops applying.
-zenoh-gateway = { git = "https://github.com/dimensionalOS/zenoh-gateway", rev = "7a4a9a27e259beb9f3d66248ac5b4df3b6206310" }
+zenoh-gateway = { git = "https://github.com/dimensionalOS/zenoh-gateway", rev = "86b2fe53034616dbd91e80eb30e1545a17faa158" }

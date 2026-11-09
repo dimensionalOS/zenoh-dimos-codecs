@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-dimos-codecs"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 rust-version = "1.88"
 description = "zenoh-gateway codecs for ROS 2 and dimos images, compressed video (H.264, H.265), depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
@@ -22,7 +22,7 @@ gstreamer = []
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
-zenoh-gateway = "0.5.37"
+zenoh-gateway = "0.5.39"
 anyhow = "1"
 # encodeOptions
 serde_json = "1"

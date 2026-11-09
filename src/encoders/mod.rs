@@ -194,7 +194,7 @@ fn probe(backend: Backend) -> Result<Selected> {
             });
             let hardware: Factory = Box::new(move || match gstreamer::GstreamerEncoder::with_element(element) {
                 Ok(encoder) => Box::new(encoder),
-                Err(error) => Box::new(Failed(format!("{element}: {error:#}"))),
+                Err(error) => Box::new(Failed(VideoFormat::H264, format!("{element}: {error:#}"))),
             });
             Ok(Selected { name: format!("gstreamer {element}"), factory: Some(factory), hardware: Some(hardware) })
         }
@@ -203,52 +203,81 @@ fn probe(backend: Backend) -> Result<Selected> {
 }
 
 /// A hardware encoder that could not be made: every encode fails with why (a child process running it exits and is
-/// started again, which may find the device working).
+/// started again, which may find the device working). It still has to report the format it was asked for, since the
+/// gateway picked it for a track of that format.
 #[cfg(feature = "gstreamer")]
-struct Failed(String);
+struct Failed(VideoFormat, String);
 
 #[cfg(feature = "gstreamer")]
 impl VideoEncoder for Failed {
     fn format(&self) -> VideoFormat {
-        VideoFormat::H264
+        self.0
     }
 
     fn encode(&mut self, _: &DecodedFrame, _: &VideoTarget) -> Result<Option<EncodedVideo>> {
-        bail!("{}", self.0)
+        bail!("{}", self.1)
     }
 }
 
-/// A hardware encoder that hands over to software H.264 for good after its first error (from a keyframe).
+/// A hardware encoder that hands over to a software one of **its own format** for good after its first error (from a
+/// keyframe), or reports the error when there is no software encoder of that format to hand over to.
+///
+/// The format matters and used to be assumed. This hardcoded `VideoFormat::H264` for both its own `format()` and its
+/// fallback, which is correct only while every encoder is an H.264 one. It is not a tidiness point: a track carries
+/// what it negotiated, so handing a VP8 track's frames to an H.264 encoder would put H.264 on the wire under a VP8
+/// payload type — a black picture rather than a clean failure, and nothing in the logs to say why. And H.264 is not a
+/// universal floor to fall back *to* either: Firefox's WebRTC H.264 is Cisco's OpenH264 plugin, downloaded per
+/// profile, so on a fresh profile a fallback to H.264 is a fallback to nothing the client can play.
 pub struct Fallback<E> {
     name: &'static str,
+    /// fixed for this encoder's life, as [`VideoEncoder::format`] requires, so it still answers once the hardware
+    /// encoder has been given up on and dropped
+    format: VideoFormat,
     hardware: Option<E>,
-    software: H264Encoder,
+    /// H.264 is the only format with a software encoder here, so only an H.264 pipeline has anything to fall back to
+    software: Option<H264Encoder>,
 }
 
 impl<E: VideoEncoder> Fallback<E> {
-    /// Wraps `hardware` (an H.264 encoder) called `name` in the logs.
+    /// Wraps `hardware`, called `name` in the logs, falling back within `hardware`'s own format.
     pub fn new(name: &'static str, hardware: E) -> Self {
-        Fallback { name, hardware: Some(hardware), software: H264Encoder::default() }
+        let format = hardware.format();
+        Fallback { name, format, hardware: Some(hardware), software: (format == VideoFormat::H264).then(H264Encoder::default) }
     }
 }
 
 impl<E: VideoEncoder> VideoEncoder for Fallback<E> {
     fn format(&self) -> VideoFormat {
-        VideoFormat::H264
+        self.format
     }
 
     fn encode(&mut self, frame: &DecodedFrame, target: &VideoTarget) -> Result<Option<EncodedVideo>> {
         if let Some(hardware) = &mut self.hardware {
             match hardware.encode(frame, target) {
                 Ok(encoded) => return Ok(encoded),
-                Err(error) => {
+                // said differently in the two cases, because what happens next differs: one degrades and carries on,
+                // the other stops. A stream that stops wants the reason in the line that stopped it.
+                Err(error) if self.software.is_some() => {
                     log::warn!("{}: {error:#}; software H.264 from here on", self.name);
                     self.hardware = None;
                 }
+                // The hardware is deliberately **kept** here, unlike the branch above. There is nothing to replace
+                // it with, so giving up on it would end the stream for good, while retrying costs one failed encode
+                // per frame and lets a device that comes back be used again — which is the same reasoning as running a
+                // hardware encoder in a child process that gets restarted. The gateway counts these in the
+                // subscription's `encodingErrors`, so it is visible rather than silent.
+                Err(error) => {
+                    log::warn!("{}: {error:#}; there is no software {:?} encoder here to carry on with, so this will be retried", self.name, self.format);
+                    return Err(error);
+                }
             }
         }
-        // a new software encoder starts with a keyframe
-        self.software.encode(frame, target)
+        // a new software encoder starts with a keyframe. Unreachable without one: the only branch that clears the
+        // hardware is the one that checked there is a software encoder to clear it in favour of.
+        match &mut self.software {
+            Some(software) => software.encode(frame, target),
+            None => bail!("{} failed and there is no software {:?} encoder here to replace it", self.name, self.format),
+        }
     }
 
     fn last_frame_id(&self) -> Option<u64> {
@@ -272,11 +301,12 @@ mod tests {
         DecodedFrame::Video(VideoImage::rgb8(width, height, pixels.collect()).unwrap())
     }
 
-    struct Broken;
+    /// An encoder of `0` that always fails, to stand in for a device that went away.
+    struct Broken(VideoFormat);
 
     impl VideoEncoder for Broken {
         fn format(&self) -> VideoFormat {
-            VideoFormat::H264
+            self.0
         }
 
         fn encode(&mut self, _: &DecodedFrame, _: &VideoTarget) -> Result<Option<EncodedVideo>> {
@@ -295,11 +325,31 @@ mod tests {
 
     #[test]
     fn a_failing_encoder_hands_over_to_software_from_a_keyframe() {
-        let mut encoder = Fallback::new("broken", Broken);
+        let mut encoder = Fallback::new("broken", Broken(VideoFormat::H264));
         let target = VideoTarget::new(64, 48, 500_000, 30.0);
         let first = encoder.encode(&quadrants(64, 48), &target).unwrap().unwrap();
         assert!(first.keyframe && first.data.starts_with(&[0, 0, 0, 1]));
         assert!(!encoder.encode(&quadrants(64, 48), &target).unwrap().unwrap().keyframe, "software from then on");
+    }
+
+    /// A hardware encoder of a format with no software encoder here must **fail**, not hand its frames to the H.264
+    /// one. The track carries what it negotiated, so H.264 bytes under another payload type are a black picture rather
+    /// than a clean failure — and nothing in the logs would say so. This is what the old hardcoded
+    /// `VideoFormat::H264` got wrong in both places: the format it reported and the encoder it fell back to.
+    #[test]
+    fn an_encoder_with_no_software_twin_reports_its_failure_instead_of_changing_format() {
+        for format in [VideoFormat::Vp8, VideoFormat::Vp9, VideoFormat::Av1] {
+            let mut encoder = Fallback::new("broken", Broken(format));
+            assert_eq!(encoder.format(), format, "it reports the format it was made for, not H.264");
+            let error = encoder.encode(&quadrants(64, 48), &VideoTarget::new(64, 48, 500_000, 30.0)).unwrap_err().to_string();
+            assert!(error.contains("the device went away"), "the first failure is the device's own: {error}");
+            // It keeps trying the device rather than quietly becoming an H.264 encoder, and keeps reporting the
+            // device's own error: there is nothing to replace it with, so giving up would end the stream for good
+            // while retrying lets a device that comes back be used again.
+            let again = encoder.encode(&quadrants(64, 48), &VideoTarget::new(64, 48, 500_000, 30.0)).unwrap_err().to_string();
+            assert!(again.contains("the device went away"), "{again}");
+            assert_eq!(encoder.format(), format, "and its format never changes, as the trait requires");
+        }
     }
 
     /// Decodes Annex B H.264 and returns the RGB pixel at (x, y) of the last picture.

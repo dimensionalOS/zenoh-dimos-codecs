@@ -10,7 +10,7 @@
 //! `av1-asm` feature, because on x86 building it needs nasm.
 
 use super::compressed_video::i420_from_planes;
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::DAV1D_PIXEL_LAYOUT_I420;
@@ -149,20 +149,65 @@ pub(crate) fn temporal_unit(data: &[u8]) -> Result<TemporalUnit> {
     })
 }
 
-/// Fails, saying why, unless `data` decodes on its own: a sequence header and a shown key frame in the one unit.
-pub(crate) fn check_decodable_alone(data: &[u8]) -> Result<()> {
-    let unit = temporal_unit(data)?;
-    ensure!(unit.sequence_header.is_some(), "AV1 unit has no sequence header OBU (types {:?}): each sample is decoded on its own, so the publisher must put one in front of every keyframe", unit.types);
-    ensure!(unit.keyframe, "AV1 unit isn't a shown key frame (OBU types {:?}): each sample is decoded on its own, so the publisher must send keyframes only", unit.types);
-    Ok(())
-}
-
 /// The first picture in a temporal unit, as I420. Each sample is decoded by a decoder of its own, so the unit has to
-/// carry its sequence header and a key frame; [`check_decodable_alone`] is what says so first.
+/// carry its sequence header and a key frame;
+/// [`bitstream::check_decodable_alone`](crate::utils::bitstream::check_decodable_alone) is what says so first, in the
+/// same words for every codec.
 pub fn decode(data: &[u8]) -> Result<VideoImage> {
     let mut decoder = Decoder::open()?;
     decoder.send(data)?;
     decoder.picture()
+}
+
+/// A decoder that keeps its state between temporal units, so **predicted frames decode**.
+///
+/// [`decode`] opens a decoder per call, which is right when each sample is sent on its own but means only a key frame
+/// ever produces a picture. A `Stream` is fed every temporal unit of one stream, in order, and gives back each picture
+/// as it completes — the same shape as [`h264::Stream`](super::h264::Stream) and [`h265::Stream`](super::h265::Stream).
+///
+/// rav1d needs no system library and no C toolchain, so unlike the H.265 path this works in a static musl build and on
+/// a machine with nothing installed. Its hand-written assembly (worth several times the speed) is behind this crate's
+/// `av1-asm` feature, off by default because on x86 building it needs nasm and a build dependency nobody asked for is
+/// exactly what must not be imposed on a downstream crate.
+pub struct Stream {
+    decoder: Decoder,
+    /// skipping until the next key frame: nothing decodable has been fed yet, or samples were lost
+    resyncing: bool,
+}
+
+// SAFETY: an rav1d context is not thread safe, and `Stream` owns its decoder and lends it to nobody, so the context is
+// only ever touched through `&mut self`. The gateway hands a stream decoder from one blocking task to the next, never
+// to two at once, which is what `Send` (and not `Sync`) says.
+unsafe impl Send for Stream {}
+
+impl Stream {
+    /// A decoder waiting for its first key frame.
+    pub fn new() -> Result<Self> {
+        Ok(Stream { decoder: Decoder::open()?, resyncing: true })
+    }
+
+    /// Start over at the next key frame, because samples before it were lost.
+    ///
+    /// The decoder itself is kept, as on the other two paths: a key frame has no references, so it makes the picture
+    /// whole by itself, and that is the whole of what a new decoder would give.
+    pub fn resync(&mut self) {
+        self.resyncing = true;
+    }
+
+    /// Feeds one temporal unit, which follows every unit fed before it, and returns the picture it completed.
+    ///
+    /// `keyframe`: the unit is decodable on its own (a shown key frame with its sequence header). While resyncing,
+    /// anything else is dropped unread and this gives `Ok(None)`.
+    pub fn push(&mut self, data: &[u8], keyframe: bool) -> Result<Option<VideoImage>> {
+        if self.resyncing {
+            if !keyframe {
+                return Ok(None);
+            }
+            self.resyncing = false;
+        }
+        self.decoder.send(data)?;
+        self.decoder.try_picture()
+    }
 }
 
 /// An open rav1d decoder, closed on drop.
@@ -201,13 +246,31 @@ impl Decoder {
         Ok(())
     }
 
-    fn picture(&mut self) -> Result<VideoImage> {
+    /// The picture that is ready, or `None` because the decoder wants more data first.
+    ///
+    /// `EAGAIN` is not an error here: a decoder that holds a frame answers it for every unit until one comes out, and
+    /// treating it as a failure would make a working stream look broken (and, on the per-sample path, would hide the
+    /// real reason a sample produced nothing).
+    fn try_picture(&mut self) -> Result<Option<VideoImage>> {
         let mut picture = Dav1dPicture::default();
         // SAFETY: the context is open and `picture` is a live, zeroed local, as dav1d_get_picture wants.
         let result = unsafe { dav1d_get_picture(self.context, NonNull::new(&mut picture)) };
         // owned from here, so an early return below still unreferences it
         let picture = Picture(picture);
-        ensure!(result.0 == 0, "rav1d decoded no picture from the AV1 temporal unit ({})", result.0);
+        if result.0 == -(libc::EAGAIN as std::ffi::c_int) {
+            return Ok(None);
+        }
+        ensure!(result.0 == 0, "rav1d could not give a picture for the AV1 temporal unit ({})", result.0);
+        Self::read(&picture).map(Some)
+    }
+
+    /// The picture a unit must have produced, or why it did not.
+    fn picture(&mut self) -> Result<VideoImage> {
+        self.try_picture()?.context("rav1d decoded no picture from the AV1 temporal unit")
+    }
+
+    /// One of rav1d's pictures as an I420 [`VideoImage`].
+    fn read(picture: &Picture) -> Result<VideoImage> {
         let parameters = &picture.0.p;
         ensure!(parameters.layout == DAV1D_PIXEL_LAYOUT_I420, "AV1 picture is not 4:2:0 (layout {})", parameters.layout);
         ensure!(parameters.bpc == 8, "AV1 picture is {}-bit, and the video path takes 8-bit I420", parameters.bpc);
@@ -266,8 +329,7 @@ mod tests {
     fn a_unit_without_a_sequence_header_has_no_size() {
         let unit = temporal_unit(&fixture("compressed/pattern_bare.av1")).unwrap();
         assert_eq!((unit.keyframe, unit.size, unit.sequence_header), (true, None, None));
-        let error = check_decodable_alone(&fixture("compressed/pattern_bare.av1")).unwrap_err().to_string();
-        assert!(error.contains("no sequence header"), "{error}");
+        // what the per-sample path makes of that is `bitstream`'s to say, in the same words it uses for H.26x
     }
 
     #[test]
@@ -281,6 +343,74 @@ mod tests {
         let short = obus(&[0x12, 0x40, 1, 2, 3]).unwrap_err().to_string();
         assert!(short.contains("truncated"), "{short}");
         assert!(obus(&[]).unwrap_err().to_string().contains("empty"));
+    }
+
+    /// The temporal units of a stream written as one buffer, split where each temporal delimiter starts one.
+    ///
+    /// Test-only: a publisher sends one unit per sample, which is what [`temporal_unit`] takes. An encoder writing to a
+    /// file concatenates them, so a fixture of a real stream has to be cut back into samples to be fed as one.
+    fn temporal_units(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut units: Vec<Vec<u8>> = Vec::new();
+        for obu in obus(data).unwrap() {
+            if obu.kind == OBU_TEMPORAL_DELIMITER || units.is_empty() {
+                units.push(Vec::new());
+            }
+            units.last_mut().expect("just pushed").extend_from_slice(obu.bytes);
+        }
+        units
+    }
+
+    /// The fixture is what the tests below rest on, so what it *is* gets asserted rather than assumed: twelve samples,
+    /// the first a key frame carrying its sequence header and the other eleven predicted from it.
+    #[test]
+    fn the_predicted_fixture_is_one_keyframe_and_eleven_inter_frames() {
+        let units = temporal_units(&fixture("compressed/pattern_predicted.av1"));
+        assert_eq!(units.len(), 12);
+        let first = temporal_unit(&units[0]).unwrap();
+        assert_eq!((first.keyframe, first.size), (true, Some((320, 240))));
+        assert!(first.sequence_header.is_some());
+        for (index, unit) in units.iter().enumerate().skip(1) {
+            let read = temporal_unit(unit).unwrap();
+            assert!(!read.keyframe, "unit {index} is predicted");
+            assert_eq!((read.size, read.sequence_header), (None, None), "unit {index} carries no sequence header");
+        }
+    }
+
+    /// The whole reason a stateful decoder exists: every predicted frame decodes, where the per-sample path gets one
+    /// picture in twelve. The pictures are checked against the pattern too — a decoder that produced *something* for
+    /// each unit while losing the reference chain would otherwise pass.
+    #[test]
+    fn a_stream_decodes_the_predicted_frames_a_per_sample_decode_cannot() {
+        let units = temporal_units(&fixture("compressed/pattern_predicted.av1"));
+        // alone, only the first unit decodes at all
+        crate::utils::compressed_video::tests::assert_like_pattern(&decode(&units[0]).unwrap(), "the key frame alone");
+        assert!(decode(&units[1]).is_err(), "a predicted frame cannot be decoded on its own");
+
+        let mut stream = Stream::new().unwrap();
+        let mut pictures = 0;
+        for (index, unit) in units.iter().enumerate() {
+            let read = temporal_unit(unit).unwrap();
+            if let Some(picture) = stream.push(unit, read.keyframe).unwrap() {
+                crate::utils::compressed_video::tests::assert_like_pattern(&picture, &format!("stream picture {index}"));
+                pictures += 1;
+            }
+        }
+        assert_eq!(pictures, units.len(), "every unit of the stream produced its picture");
+    }
+
+    /// After a gap the decoder must show nothing until the next key frame, rather than a picture built on frames it
+    /// never saw — and it must not need a *new* decoder to do it.
+    #[test]
+    fn a_stream_waits_for_a_key_frame_before_and_after_a_gap() {
+        let units = temporal_units(&fixture("compressed/pattern_predicted.av1"));
+        let mut stream = Stream::new().unwrap();
+        // before any key frame there is nothing to predict from
+        assert!(stream.push(&units[3], false).unwrap().is_none());
+        assert!(stream.push(&units[0], true).unwrap().is_some(), "the key frame starts it");
+        assert!(stream.push(&units[1], false).unwrap().is_some());
+        stream.resync();
+        assert!(stream.push(&units[2], false).unwrap().is_none(), "nothing after a gap until a key frame");
+        assert!(stream.push(&units[0], true).unwrap().is_some(), "and the next key frame makes it whole");
     }
 
     #[test]

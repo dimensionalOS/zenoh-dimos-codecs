@@ -724,14 +724,6 @@ impl JpegDecoder {
     }
 }
 
-/// The element an [`H265Decoder`] decodes with unless the settings name another: libav's HEVC decoder,
-/// which GStreamer wraps. On an RK3588 A76 core it does ~91 fps of 720p against libde265's ~50, and libde265 on the
-/// little cores managed 14-18 — software H.265 is only fast enough here with this one.
-///
-/// Set it to `mppvideodec` where the Rockchip VPU is reachable (`librockchip_mpp`, `/dev/mpp_service`): the pipeline is
-/// otherwise identical, which is the point of naming the element rather than hard-coding it.
-const DEFAULT_H265_DECODER: &str = "avdec_h265";
-
 /// Decoders whose sink caps ask for `parsed=true`, which only an `h265parse` upstream sets.
 ///
 /// **An RK3588's `mppvideodec` is not yet usable through this and needs one more thing tried.** With the parser in
@@ -1159,7 +1151,7 @@ mod tests {
         }
         // every decoder known to need the parser is named, so none of them silently gets the parser-free pipeline
         assert!(PARSED_INPUT_DECODERS.contains(&"mppvideodec"), "the RK3588's decoder is the one this was found with");
-        assert!(!PARSED_INPUT_DECODERS.contains(&DEFAULT_H265_DECODER), "libav's must keep the pipeline it is known to work with");
+        assert!(!PARSED_INPUT_DECODERS.contains(&crate::settings::DEFAULT_H265_DECODER), "libav's must keep the pipeline it is known to work with");
     }
 
     /// Caps GStreamer cannot parse are a pipeline that cannot be built, and the encoder then falls back silently.

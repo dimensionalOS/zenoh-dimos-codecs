@@ -18,7 +18,7 @@
 mod annex_b;
 mod obu;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use zenoh_gateway::VideoFormat;
 
 pub use annex_b::{Annex, H264, H265, nal_units};
@@ -161,14 +161,10 @@ pub fn unit_of(format: &str, data: &[u8]) -> Result<Unit> {
     by_name(format)?.unit(data)
 }
 
-/// Fails unless `track` is a format the gateway can put on the wire at all, so a subscription to a channel nothing
-/// could ever fill is refused when it opens rather than on its first frame.
-pub(crate) fn track_is_sendable(track: VideoFormat) -> Result<()> {
-    if of(track).is_some() {
-        return Ok(());
-    }
-    bail!("there is no {track:?} bitstream reader here, so nothing could be forwarded to that track")
-}
+// There is deliberately no "can this track be served?" asked of a channel on its own. Whether it can depends on the
+// source as well, which is not known until a sample arrives, and on whether the *server* installed an encoder of that
+// format (`ServerBuilder::video_encoder`), which an encoding cannot see. Refusing a subscription from here would
+// therefore turn a working path into a closed one. The pair is named where it is known, in the stream decoder.
 
 #[cfg(test)]
 mod tests {
@@ -273,9 +269,8 @@ mod tests {
         }
         assert!(!passes_through(VideoFormat::H265, VideoFormat::H264), "the Firefox path: decode and encode again");
         assert!(!passes_through(VideoFormat::H264, VideoFormat::Av1));
-        // the formats the gateway can send but nothing here reads are exactly the ones a source cannot be forwarded to
-        assert!(track_is_sendable(VideoFormat::Av1).is_ok());
-        let error = track_is_sendable(VideoFormat::Vp8).unwrap_err().to_string();
-        assert!(error.contains("no Vp8 bitstream reader"), "{error}");
+        // a format the gateway can send but nothing here reads can only ever be reached by encoding to it
+        assert!(of(VideoFormat::Av1).is_some());
+        assert!(of(VideoFormat::Vp8).is_none(), "nothing here reads VP8, so a VP8 track is reachable only by encoding");
     }
 }

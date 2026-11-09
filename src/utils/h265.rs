@@ -259,14 +259,6 @@ mod tests {
     }
 }
 
-/// How many worker threads a [`Stream`] decoder gets, unless the settings say otherwise. HEVC at 720p30 is more
-/// than one core can hold, and a context's workers are internal to it, so they do not disturb the order access units are
-/// fed in. Capped low because every camera has its own decoder.
-/// Measured on one 720p capture from the robot (13th-gen i7, release): 1 thread 99 fps, 2 threads 151, 4 threads 192.
-/// Two is the knee — it buys half again as much for one extra thread, while four would give two cameras eight threads
-/// and leave the encoders nothing. Where this is not enough the answer is a hardware decoder, not more threads.
-const DEFAULT_WORKER_THREADS: usize = 2;
-
 /// Worker threads per decoder: [`Settings::h265_threads`](crate::settings::Settings::h265_threads), never more than
 /// this machine has.
 fn worker_threads() -> usize {

@@ -35,9 +35,20 @@ const GST_JPEG_IN_FLIGHT: usize = 6;
 /// Frames an H.265 decoder keeps inside itself. One lets a decode overlap the next arrival; zero waits for every
 /// picture, which costs about a frame interval of latency but holds nothing back.
 const H265_FRAMES_INSIDE: usize = 1;
-/// Worker threads per libde265 decoder.
+/// Worker threads per libde265 decoder. HEVC at 720p30 is more than one core can hold, and a context's workers are
+/// internal to it, so they do not disturb the order access units are fed in — but it is capped low because every
+/// camera has a decoder of its own.
+/// Measured on one 720p capture from the robot (13th-gen i7, release): 1 thread 99 fps, 2 threads 151, 4 threads 192.
+/// Two is the knee: it buys half again as much for one extra thread, while four would give two cameras eight threads
+/// and leave the encoders nothing. Where two is not enough the answer is a hardware decoder, not more threads.
 const H265_THREADS: usize = 2;
-/// libav's HEVC decoder, which is faster than libde265 and present wherever GStreamer's libav plugin is.
+/// libav's HEVC decoder, which GStreamer wraps: faster than libde265 and present wherever GStreamer's libav plugin is.
+/// On an RK3588 A76 core it does ~91 fps of 720p against libde265's ~50, and libde265 on the little cores managed
+/// 14-18 — software H.265 is only fast enough on that hardware with this one.
+///
+/// Set [`Settings::h265_gst_decoder`] to `mppvideodec` where the Rockchip VPU is reachable (`librockchip_mpp`,
+/// `/dev/mpp_service`, and a process that can open them — they are root-only on the M20): the pipeline is otherwise
+/// identical, which is the point of naming the element rather than hard-coding it.
 pub const DEFAULT_H265_DECODER: &str = "avdec_h265";
 
 /// How this crate should decode and encode. Build with [`Settings::default`] and change what you mean to change.

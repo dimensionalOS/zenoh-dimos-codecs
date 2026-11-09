@@ -257,7 +257,9 @@ impl Decoder {
         let result = unsafe { dav1d_get_picture(self.context, NonNull::new(&mut picture)) };
         // owned from here, so an early return below still unreferences it
         let picture = Picture(picture);
-        if result.0 == -(libc::EAGAIN as std::ffi::c_int) {
+        // `libc` is a Linux-only dependency here (core pinning), and EAGAIN is 11 on Linux and 35 on macOS, so the
+        // errno is read through std, which knows each platform's number
+        if std::io::Error::from_raw_os_error(-result.0).kind() == std::io::ErrorKind::WouldBlock {
             return Ok(None);
         }
         ensure!(result.0 == 0, "rav1d could not give a picture for the AV1 temporal unit ({})", result.0);

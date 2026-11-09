@@ -1,10 +1,14 @@
-//! The stateful side of compressed video: a [`StreamDecoder`] that keeps one H.265 decoder per stream, so predicted
-//! frames decode and the gateway can re-encode all of them.
+//! The stateful side of compressed video: a [`StreamDecoder`] that keeps one decoder per stream, so predicted frames
+//! decode and the gateway can forward or re-encode all of them.
 //!
-//! This is the path a browser with no HEVC decoder takes (Firefox, which has no H.265 over WebRTC). Such a browser
-//! cannot be sent the publisher's bitstream, so the gateway has to decode it and encode it again — and
-//! [`compressed_video::to_video`](super::compressed_video::to_video) decodes each sample on its own, which only a
-//! keyframe can be. On this camera that is one frame in thirty.
+//! Two jobs, decided per sample by the pair of formats ([`bitstream::passes_through`]):
+//! - the track wants what the publisher sent, so the coded unit is **forwarded** — nothing is decoded and the
+//!   receiver's own decoder keeps the reference chain;
+//! - it wants something else, so the unit is **decoded** here and the track's encoder makes the frame again.
+//!
+//! Either way the stream has to arrive whole. [`compressed_video::to_video`](super::compressed_video::to_video)
+//! decodes each sample on its own, which only a keyframe can be — on a camera with a keyframe a second that is one
+//! frame in thirty, and it is why this exists.
 //!
 //! A decoder that keeps its state fixes that but changes what it needs: every sample of the stream, in arrival order,
 //! with nothing skipped. The gateway arranges that for a `StreamDecoder` — it stops thinning the stream, decodes one
@@ -13,130 +17,28 @@
 //! keyframe rather than showing a picture built on frames it never saw.
 
 use super::bitstream;
-use super::h265;
+use crate::decoders::{self, StreamingDecoder};
 use crate::codecs::msgs::{CompressedVideo, Header};
 use anyhow::{Context, Result, ensure};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoFormat, VideoImage};
+use zenoh_gateway::{DecodedFrame, EncodingSample, StreamDecoder, VideoFormat};
 
 /// How a compressed-video encoding reads its own wire format (`ros2_compressed_video`'s CDR,
 /// `dimos_lcm_compressed_video`'s LCM), so one decoder serves both.
 pub type Parse = for<'a> fn(&'a [u8]) -> Result<CompressedVideo<'a>>;
 
-/// Which decoder a stream ended up with, since it depends on what is installed.
-enum Backend {
-    /// GStreamer, by default libav's `avdec_h265`: ~91 fps of 720p on an RK3588 A76 core
-    #[cfg(feature = "gstreamer")]
-    Gstreamer(crate::encoders::gstreamer::H265Decoder),
-    /// libde265, loaded with dlopen: ~50 fps on the same core, and the only one where GStreamer is not installed
-    Libde265(h265::Stream),
-}
-
-impl Backend {
-    /// The fastest decoder this machine has. GStreamer first: on the hardware this runs on, libde265 is not fast
-    /// enough for one camera at 30 Hz, let alone two, and `avdec_h265` is nearly twice as quick. libde265 stays as the
-    /// fallback because it needs only a shared library, and it is what a developer machine without GStreamer gets.
-    ///
-    /// [`Settings::force_libde265`](crate::settings::Settings::force_libde265) forces the fallback, to compare them
-    /// on one machine.
-    fn best() -> Result<Self> {
-        Self::best_with(crate::settings::settings().force_libde265)
-    }
-
-    /// [`Backend::best`] with the choice passed in, so a test can measure both on one machine without the settings
-    /// (which are fixed for a process once read).
-    fn best_with(forced: bool) -> Result<Self> {
-        // every branch below says which decoder it picked and why. The two differ by nearly twice in speed (~83 fps of
-        // 720p against ~50 on an RK3588 core), and a stale `force_libde265` left in a config quietly costing that
-        // much is exactly the kind of thing that gets blamed on the hardware for an afternoon.
-        #[cfg(feature = "gstreamer")]
-        let why = if forced {
-            " (force_libde265 asks for it; GStreamer's is faster where it is installed)".to_owned()
-        } else {
-            match crate::encoders::gstreamer::H265Decoder::new() {
-                Ok(decoder) => {
-                    log::info!("H.265 stream decoding with GStreamer {}", decoder.element());
-                    return Ok(Backend::Gstreamer(decoder));
-                }
-                Err(error) => format!(" (no GStreamer H.265 decoder: {error:#})"),
-            }
-        };
-        #[cfg(not(feature = "gstreamer"))]
-        let why = String::new();
-        let _ = &forced;
-        let stream = h265::Stream::new().context("no H.265 decoder: neither a GStreamer one nor libde265")?;
-        log::info!("H.265 stream decoding with libde265{why}");
-        Ok(Backend::Libde265(stream))
-    }
-
-    /// One access unit in, a picture out with the `frame_id` of the unit it came from — which is an earlier unit's for
-    /// a decoder that holds frames. `keyframe`: the unit is decodable on its own.
-    fn decode(&mut self, access_unit: &[u8], keyframe: bool, size: Option<(u32, u32)>, frame_id: u64) -> Result<Option<(VideoImage, u64)>> {
-        match self {
-            #[cfg(feature = "gstreamer")]
-            Backend::Gstreamer(decoder) => {
-                // GStreamer is handed the size because nothing in the pipeline reports it back; before any parameter
-                // set has said what it is there is also no keyframe to start from, so there is nothing to decode yet
-                let Some(size) = size else { return Ok(None) };
-                // a fresh pipeline cannot use a predicted frame, and pushing one anyway costs a full output timeout
-                // waiting for a picture that will never come - seconds per frame, which is far worse than the second
-                // of pictures a resync should cost
-                if decoder.needs_keyframe() && !keyframe {
-                    return Ok(None);
-                }
-                let Some((data, frame_id)) = decoder.decode(access_unit, size, frame_id)? else { return Ok(None) };
-                VideoImage::i420(size.0, size.1, data).map(|picture| Some((picture, frame_id)))
-            }
-            // libde265 reports its own picture size, so it has no use for `size` (which only GStreamer needs told), and
-            // it holds no frames: the picture it gives is the unit just pushed
-            Backend::Libde265(stream) => {
-                let _ = size;
-                Ok(stream.push(access_unit, keyframe)?.map(|picture| (picture, frame_id)))
-            }
-        }
-    }
-
-    fn resync(&mut self) {
-        match self {
-            // its pipeline is kept: a keyframe clears the reference pictures by itself, and rebuilding on every lost
-            // sample is ~35 ms of stall each on a decoder that was working
-            #[cfg(feature = "gstreamer")]
-            Backend::Gstreamer(decoder) => decoder.resync(),
-            Backend::Libde265(stream) => stream.resync(),
-        }
-    }
-
-    /// Pipelines the decoder has built (0 where there is no pipeline to build).
-    fn pipelines_made(&self) -> u64 {
-        match self {
-            #[cfg(feature = "gstreamer")]
-            Backend::Gstreamer(decoder) => decoder.pipelines_made(),
-            Backend::Libde265(_) => 0,
-        }
-    }
-
-    /// How many access units may be inside before a `decode` waits for its picture. libde265 holds none either way.
-    fn hold(&mut self, frames: u64) {
-        match self {
-            #[cfg(feature = "gstreamer")]
-            Backend::Gstreamer(decoder) => decoder.hold(frames),
-            Backend::Libde265(_) => {}
-        }
-        let _ = frames;
-    }
-}
-
-/// Keeps one H.265 decoder for a stream of `foxglove_msgs/CompressedVideo`, so its predicted frames decode.
+/// Keeps one decoder for a stream of `foxglove_msgs/CompressedVideo`, so its predicted frames decode.
 ///
-/// The decoder is made on the first H.265 sample rather than up front: the gateway asks for one of these before any
-/// sample has arrived, so the format is not known yet, and a stream that turns out to be H.264 should not have started
-/// libde265 and its threads for nothing.
+/// The decoder is made on the first sample that needs one rather than up front, for two reasons: the gateway asks for
+/// one of these before any sample has arrived, so the *source* format is not known yet — and a stream the track wants
+/// as it is never needs a decoder at all, so building one would start threads and pipelines for nothing.
 pub struct CompressedVideoStream {
     parse: Parse,
-    /// the video track's output format: an H.264 track fed an H.264 source passes it through (no decode); anything else is decoded
+    /// the video track's output format: a source already in it is forwarded, anything else is decoded for the encoder
     target: VideoFormat,
-    h265: Option<Backend>,
+    /// the decoder for the *source* format, once a sample has said what that is and that one is needed
+    decoder: Option<Box<dyn StreamingDecoder>>,
     /// the newest headers, to put back in front of a keyframe that arrives without them
     headers: Option<Vec<u8>>,
     /// the newest size any sequence parameter set gave: the units between keyframes carry none
@@ -195,14 +97,14 @@ const HEADERS_MAX: usize = 8;
 impl CompressedVideoStream {
     /// A decoder for an encoding that reads its messages with `parse`.
     pub fn new(parse: Parse, target: VideoFormat) -> Self {
-        CompressedVideoStream { parse, target, h265: None, headers: None, size: None, last_frame_id: None, message_headers: VecDeque::new(), hold: None, timings: Timings::default() }
+        CompressedVideoStream { parse, target, decoder: None, headers: None, size: None, last_frame_id: None, message_headers: VecDeque::new(), hold: None, timings: Timings::default() }
     }
 
     /// Decoder pipelines this stream has built, where its decoder builds one (GStreamer): **one** for a stream, for
     /// its life. A lost sample does not need another — a keyframe clears the reference pictures by itself — and one
     /// per lost sample cost ~35 ms of stall each on a decoder that was working.
     pub fn pipelines_made(&self) -> u64 {
-        self.h265.as_ref().map_or(0, Backend::pipelines_made)
+        self.decoder.as_ref().map_or(0, |decoder| decoder.pipelines_made())
     }
 
     /// How many samples the decoder may hold before it waits for a picture, over what the decoder picks for itself.
@@ -212,8 +114,8 @@ impl CompressedVideoStream {
     /// is what the tests of what a single sample means are written against.
     pub fn hold(&mut self, frames: u64) {
         self.hold = Some(frames);
-        if let Some(backend) = &mut self.h265 {
-            backend.hold(frames);
+        if let Some(decoder) = &mut self.decoder {
+            decoder.hold(frames);
         }
     }
 }
@@ -238,18 +140,28 @@ impl StreamDecoder for CompressedVideoStream {
             self.timings.prepare += part.elapsed();
             return Ok(Some(DecodedFrame::data(unit)));
         }
-        // anything else has to be decoded, which needs a decoder for the *source* format
-        ensure!(source.format() == VideoFormat::H265, "a {:?} stream can only be forwarded to a {:?} track, not transcoded to {:?}: there is no stateful {:?} decoder here", source.format(), source.format(), self.target, source.format());
+        // A track the gateway only ever forwards has no encoder behind it, so a source in another format cannot reach
+        // it at all — and decoding for it would be wasted work ending in the passthrough encoder being handed a
+        // picture it cannot take. Said here, where both formats are known, rather than two stages later.
+        ensure!(
+            !self.target.passthrough_only(),
+            "a {:?} source cannot reach a {:?} track: {:?} is only ever forwarded here, never encoded, so only a {:?} publisher can feed that track",
+            source.format(),
+            self.target,
+            self.target,
+            self.target
+        );
+        // anything else has to be decoded, with a decoder for the *source* format
         let part = Instant::now();
         let (data, keyframe) = bitstream::decodable(&unit, &mut self.headers);
         if let Some(size) = unit.size {
             self.size = Some(size);
         }
         self.timings.prepare += part.elapsed();
-        let backend = match &mut self.h265 {
-            Some(backend) => backend,
+        let decoder = match &mut self.decoder {
+            Some(decoder) => decoder,
             none => {
-                let mut made = Backend::best()?;
+                let mut made = decoders::select(source).with_context(|| format!("a {:?} source cannot reach a {:?} track", source.format(), self.target))?;
                 if let Some(frames) = self.hold {
                     made.hold(frames);
                 }
@@ -261,7 +173,7 @@ impl StreamDecoder for CompressedVideoStream {
             self.message_headers.pop_front();
         }
         let part = Instant::now();
-        let decoded = backend.decode(&data, keyframe, self.size, frame_id)?;
+        let decoded = decoder.decode(&data, keyframe, self.size, frame_id)?;
         self.timings.decode += part.elapsed();
         let Some((picture, picture_id)) = decoded else { return Ok(None) };
         self.last_frame_id = Some(picture_id);
@@ -284,8 +196,8 @@ impl StreamDecoder for CompressedVideoStream {
     }
 
     fn resync(&mut self) {
-        if let Some(backend) = &mut self.h265 {
-            backend.resync();
+        if let Some(decoder) = &mut self.decoder {
+            decoder.resync();
         }
         // the samples whose pictures the decoder has thrown away: nothing will come out for them now
         self.message_headers.clear();
@@ -350,15 +262,11 @@ mod tests {
         let (keyframe, predicted) = capture();
         let mut any = false;
         for forced in [false, true] {
-            let Ok(mut backend) = Backend::best_with(forced) else {
-                eprintln!("no backend with force_libde265={forced}: skipping");
+            let Ok(mut backend) = decoders::select_with(bitstream::by_name("h265").unwrap(), forced) else {
+                eprintln!("no H.265 decoder with force_libde265={forced}: skipping");
                 continue;
             };
-            let name = match &backend {
-                #[cfg(feature = "gstreamer")]
-                Backend::Gstreamer(decoder) => format!("gstreamer {}", decoder.element()),
-                Backend::Libde265(_) => "libde265".to_owned(),
-            };
+            let name = backend.name();
             // every picture out of the call that fed it, so the count is exact and nothing overlaps the decode this
             // measures (what the pictures cost is the point here; what holding one buys is
             // `a_held_picture_comes_out_of_a_later_call`'s)
@@ -391,8 +299,8 @@ mod tests {
 
     #[test]
     fn decodes_the_predicted_frames_a_per_sample_decode_cannot() {
-        if h265::Stream::new().is_err() {
-            eprintln!("skipping: libde265 is not installed");
+        if decoders::select(bitstream::by_name("h265").unwrap()).is_err() {
+            eprintln!("skipping: no H.265 decoder on this machine");
             return;
         }
         let (keyframe, predicted) = capture();
@@ -415,7 +323,7 @@ mod tests {
 
     #[test]
     fn shows_nothing_until_a_keyframe_and_again_after_a_gap() {
-        if h265::Stream::new().is_err() {
+        if decoders::select(bitstream::by_name("h265").unwrap()).is_err() {
             return;
         }
         let (keyframe, predicted) = capture();
@@ -541,12 +449,29 @@ mod tests {
         assert_eq!(decoder.last_frame_id(), Some(0));
     }
 
-    /// A pair with no decoder for the source format says so, naming both sides and what is missing — the message is
-    /// what someone reads when a camera shows nothing on a track that cannot be reached from it.
+    /// A track that is only ever forwarded has no encoder behind it, so a source in another format cannot reach it.
+    /// That has to be said here, where both formats are known: decoding for such a track would be wasted work ending
+    /// in the passthrough encoder being handed a picture, two stages later and with a worse message.
     #[test]
-    fn an_unreachable_pair_says_which_decoder_is_missing() {
+    fn a_forward_only_track_refuses_a_source_it_cannot_be_fed_by() {
+        assert!(VideoFormat::H265.passthrough_only(), "H.265 is the forward-only track this tests");
         let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
         let error = decode(&mut decoder, &fixture("compressed/pattern.h264"), "h264").unwrap_err().to_string();
-        assert!(error.contains("H264") && error.contains("H265") && error.contains("no stateful"), "{error}");
+        assert!(error.contains("H264") && error.contains("only ever forwarded"), "{error}");
+        // and the same track takes an H.265 publisher, which is the one thing it can be fed by
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::H265);
+        let forwarded = decode(&mut decoder, &fixture("compressed/pattern.h265"), "h265").unwrap().expect("a frame");
+        assert!(matches!(forwarded, DecodedFrame::Data(_)));
+    }
+
+    /// The permutation that was impossible before there was a decoder for every source: an H.264 publisher reaching a
+    /// track of another format, which means decoding H.264 here rather than only forwarding it.
+    #[test]
+    fn an_h264_source_decodes_for_a_track_of_another_format() {
+        let mut decoder = CompressedVideoStream::new(ros2_compressed_video::parse, VideoFormat::Av1);
+        let decoded = decode(&mut decoder, &fixture("compressed/pattern.h264"), "h264").unwrap().expect("a picture");
+        let DecodedFrame::Video(picture) = decoded else { panic!("a picture, not a forwarded unit") };
+        assert_eq!((picture.width(), picture.height()), (320, 240));
+        assert_eq!(decoder.last_frame_id(), Some(0));
     }
 }

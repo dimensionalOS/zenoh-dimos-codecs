@@ -26,6 +26,8 @@
 //! client decodes them into `msg.decoded` with no codec code in the page.
 
 pub mod codecs;
+/// Choosing a decoder for a source bitstream: the fastest one *this process* can reach.
+pub mod decoders;
 /// Hardware H.264 encoders (features `videotoolbox`, `gstreamer`) with a fallback to software, for
 /// [`ServerBuilder::video_encoder`](zenoh_gateway::ServerBuilder::video_encoder).
 pub mod encoders;

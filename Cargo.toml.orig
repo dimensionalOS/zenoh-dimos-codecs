@@ -1,0 +1,70 @@
+[package]
+name = "zenoh-dimos-codecs"
+version = "0.3.15"
+edition = "2024"
+rust-version = "1.88"
+description = "zenoh-gateway codecs for ROS 2 and dimos images, compressed video (H.264, H.265, AV1), depth and point clouds, plus hardware H.264 encoders (macOS VideoToolbox, GStreamer: Jetson nvv4l2h264enc, NVENC, VAAPI) with a fallback to software"
+repository = "https://github.com/dimensionalOS/zenoh-dimos-codecs"
+license-file = "LICENSE"
+readme = "README.md"
+# only what building the library needs (no test fixtures)
+include = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE"]
+
+[features]
+default = []
+# encoders: macOS VideoToolbox (the media engine); does nothing elsewhere
+videotoolbox = []
+# encoders: GStreamer's hardware H.264 encoders, loaded at runtime (dlopen, so building needs no GStreamer): nvv4l2h264enc
+# (Jetson), nvh264enc (NVENC), vah264enc / vaapih264enc (VAAPI)
+gstreamer = []
+# AV1 decoding with dav1d's hand-written assembly (4-8x the pure-Rust fallback). x86 needs nasm to build it; aarch64
+# assembles with the C compiler already in use, so it is free there
+av1-asm = ["rav1d/asm"]
+# JPEG decoding with libjpeg-turbo (vendored C, built by cmake and linked statically; x86 needs nasm too) instead of
+# zune-jpeg: the video path gets the JPEG's own YCbCr planes, with no chroma upsampling to undo
+turbojpeg = ["dep:turbojpeg"]
+
+[dependencies]
+zenoh-gateway = "0.5.40"
+anyhow = "1"
+# encodeOptions
+serde_json = "1"
+# pure Rust decoders
+zune-jpeg = "0.5"
+turbojpeg = { version = "1.5", optional = true }
+png = "0.18"
+image-webp = "0.2"
+jxl-oxide = "0.12"
+# encodeOptions.format "jpeg" on the data channel (pure Rust)
+jpeg-encoder = "0.7"
+# encoders
+log = "0.4"
+# GStreamer (feature gstreamer) and libde265 (H.265 compressed video), loaded at runtime
+libloading = "0.9"
+# H.264 compressed video (the C sources zenoh-gateway's encoder builds anyway)
+openh264 = "0.9"
+# AV1 compressed video: rav1d, the pure-Rust port of dav1d, so no system library and no C toolchain (unlike libde265
+# for H.265). Feature `av1-asm` adds dav1d's own hand-written assembly; it is off here because on x86 rav1d's build
+# shells out to nasm, and a decoder should not make a build tool mandatory. Turn it on wherever decode speed matters.
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
+
+# (it drives the Jetson's encoder: `cargo test` elsewhere skips it instead of failing to build)
+[[example]]
+name = "transcode_bench"
+required-features = ["gstreamer"]
+
+# only to put a pipeline's streaming thread on a core of its own (`encoders::pin`); nothing else needs it
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# tests/h265_passthrough runs the Rust client against an in-process server
+zenoh-gateway = { version = "0.5.40", features = ["client"] }
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+
+[patch.crates-io]
+# zenoh 1.10.1 plus a routing fix (puts dropped after a publisher is undeclared): https://github.com/jeff-hykin/zenoh-vendor
+# the tag must match what zenoh-gateway pins (`zenoh = "=1.10.1"`): a patch cargo cannot satisfy is ignored with only a
+# warning, which is how this came to be building against unpatched zenoh after the gateway moved from 1.6.2 to 1.10.1
+zenoh = { git = "https://github.com/jeff-hykin/zenoh-vendor", tag = "zenoh-1.10.1-patch.1" }

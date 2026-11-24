@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod shared;
+pub use shared::factory as shared_factory;
+
 /// Set in a child started by a [`ProcessEncoder`]: [`serve_if_child`] serves encodes instead of returning.
 pub const CHILD_ENV: &str = "ZENOH_DIMOS_VIDEO_ENCODER_CHILD";
 
@@ -78,17 +81,29 @@ pub fn serve_if_child(factory: &(dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync
 }
 
 fn serve(factory: &(dyn Fn() -> Box<dyn VideoEncoder> + Send + Sync)) -> Result<()> {
-    let mut encoder = factory();
+    let mut encoders = std::collections::HashMap::new();
     let (mut input, mut output) = (BufReader::new(std::io::stdin().lock()), BufWriter::new(std::io::stdout().lock()));
     output.write_all(READY)?;
     output.flush()?;
     loop {
         // the parent closed the pipe: it is done with this encoder
         let Some(request) = read_request(&mut input)? else { return Ok(()) };
+        let (id, request) = match request {
+            Request::Session(id, request) => (id, *request),
+            Request::Close(id) => {
+                encoders.remove(&id);
+                write_reply(&mut output, &Ok(Vec::new()))?;
+                output.flush()?;
+                continue;
+            }
+            request => (0, request),
+        };
+        let encoder = encoders.entry(id).or_insert_with(factory);
         // an encode's own frame (or an earlier one's), then any others out already; or, asked for, the next to come out
         let (mut reply, wait) = match request {
             Request::Encode(frame, target) => (encoder.encode(&frame, &target).map(|first| first.map(|frame| (frame, encoder.last_frame_id())).into_iter().collect::<Vec<_>>()), Duration::ZERO),
             Request::Next(wait) => (Ok(Vec::new()), wait),
+            _ => bail!("nested encoder session request"),
         };
         if let Ok(frames) = &mut reply {
             let mut wait = wait;
@@ -195,6 +210,8 @@ impl ProcessEncoder {
 
     /// Kills the child (a hung one included: the OS takes back what it held) and starts another.
     fn restart(&mut self, why: &str) {
+        self.more.clear();
+        self.last_frame_id = None;
         log::warn!("video encoder process {why}: restarting it");
         if let Some(running) = self.child.take() {
             running.stop();
@@ -334,6 +351,21 @@ const REQUEST_HEADER_BYTES: usize = 1 + 8 + 4 + 4 + 4 + 8 + 1 + 8 + 1 + 4 + 4 + 
 /// A request's first byte: an encode, or a wait for the next frame out.
 const ENCODE: u8 = 0;
 const NEXT: u8 = 1;
+const SESSION: u8 = 2;
+const CLOSE: u8 = 3;
+
+fn session_request(id: u64, request: Vec<u8>) -> Vec<u8> {
+    let mut bytes = vec![SESSION];
+    bytes.extend_from_slice(&id.to_le_bytes());
+    bytes.extend(request);
+    bytes
+}
+
+fn close_request(id: u64) -> Vec<u8> {
+    let mut bytes = vec![CLOSE];
+    bytes.extend_from_slice(&id.to_le_bytes());
+    bytes
+}
 
 /// [`NEXT`], then how long the child may wait (ns u64), little endian.
 fn next_request(wait: Duration) -> Vec<u8> {
@@ -346,6 +378,8 @@ fn next_request(wait: Duration) -> Vec<u8> {
 enum Request {
     Encode(DecodedFrame, VideoTarget),
     Next(Duration),
+    Session(u64, Box<Request>),
+    Close(u64),
 }
 
 /// [`ENCODE`], then `target` (quality f64, width u32, height u32, bitrate u32, fps f64, keyframe u8, frame id u64), then
@@ -397,6 +431,13 @@ fn read_request(input: &mut impl Read) -> Result<Option<Request>> {
     match kind[0] {
         ENCODE => {}
         NEXT => return Ok(Some(Request::Next(Duration::from_nanos(u64::from_le_bytes(read_array(input)?))))),
+        SESSION => {
+            let id = u64::from_le_bytes(read_array(input)?);
+            let request = read_request(input)?.context("missing session request")?;
+            anyhow::ensure!(matches!(request, Request::Encode(..) | Request::Next(..)), "nested session request");
+            return Ok(Some(Request::Session(id, Box::new(request))));
+        }
+        CLOSE => return Ok(Some(Request::Close(u64::from_le_bytes(read_array(input)?)))),
         other => bail!("unknown request {other}"),
     }
     let quality = f64::from_le_bytes(read_array(input)?);

@@ -643,6 +643,8 @@ impl VideoEncoder for GstreamerEncoder {
         let jpeg = image.jpeg_bytes().filter(|_| self.element.name == JPEG_ENCODER).and_then(|bytes| Some((bytes, crate::hardware_jpeg::hardware_size(bytes)?)));
         let fresh = self.pipeline.as_ref().is_none_or(|pipeline| pipeline.size != size || pipeline.jpeg != jpeg.map(|(_, jpeg_size)| jpeg_size) || (pipeline.fps / target.fps).max(target.fps / pipeline.fps) > RECONFIGURE_RATIO);
         if fresh {
+            // Release the old hardware session before allocating its replacement.
+            self.pipeline = None;
             self.pipeline = Some(Pipeline::new(self.api, self.element, size, jpeg.map(|(_, jpeg_size)| jpeg_size), target.bitrate_bps, target.fps, &self.ends)?);
             log::info!("GStreamer {} encoding {}x{} on thread {}:src", self.element.name, size.0, size.1, self.ends.0);
         }

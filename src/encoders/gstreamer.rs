@@ -39,6 +39,8 @@ struct Api {
     app_sink_try_pull_sample: unsafe extern "C" fn(Pointer, u64) -> Pointer,
     force_key_unit: unsafe extern "C" fn(u64, u64, u64, c_int, u32) -> Pointer,
     class_find_property: unsafe extern "C" fn(Pointer, *const c_char) -> Pointer,
+    signal_lookup: unsafe extern "C" fn(*const c_char, usize) -> u32,
+    signal_emit_by_name: unsafe extern "C" fn(Pointer, *const c_char, ...),
     error_free: unsafe extern "C" fn(*mut GError),
     free: unsafe extern "C" fn(Pointer),
     _libraries: Vec<Library>,
@@ -107,6 +109,8 @@ impl Api {
                 app_sink_try_pull_sample: symbol!(app, "gst_app_sink_try_pull_sample"),
                 force_key_unit: symbol!(video, "gst_video_event_new_downstream_force_key_unit"),
                 class_find_property: symbol!(gobject, "g_object_class_find_property"),
+                signal_lookup: symbol!(gobject, "g_signal_lookup"),
+                signal_emit_by_name: symbol!(gobject, "g_signal_emit_by_name"),
                 error_free: symbol!(glib, "g_error_free"),
                 free: symbol!(glib, "g_free"),
                 _libraries: vec![core, app, video, gobject, glib],
@@ -392,6 +396,9 @@ struct Pipeline {
     jpeg: Option<(u32, u32)>,
     fps: f64,
     bitrate_bps: u32,
+    /// NVIDIA's force-IDR action is unsafe until its V4L2 session has started.
+    /// PLAYING and the first push are asynchronous; an output proves it is ready.
+    has_output: bool,
     /// the frame ids inside, oldest first: access units come out in order, one per frame
     inside: VecDeque<u64>,
 }
@@ -446,7 +453,7 @@ impl Pipeline {
                 bail!("GStreamer pipeline {description:?}: {message}");
             }
             let by_name = |name: &str| (api.bin_get_by_name)(pipeline, c_string(name).as_ptr());
-            let mut pipeline = Pipeline { api, pipeline, source: by_name(&ends.0), sink: by_name(&ends.1), encoder: by_name("encoder"), element, size: (width, height), jpeg, fps, bitrate_bps: 0, inside: VecDeque::new() };
+            let mut pipeline = Pipeline { api, pipeline, source: by_name(&ends.0), sink: by_name(&ends.1), encoder: by_name("encoder"), element, size: (width, height), jpeg, fps, bitrate_bps: 0, has_output: false, inside: VecDeque::new() };
             ensure!(!pipeline.source.is_null() && !pipeline.sink.is_null() && !pipeline.encoder.is_null(), "GStreamer pipeline lost its elements");
             // what the encoder was actually configured with, once per pipeline. A property that does not apply leaves
             // the encoder on its defaults, which for x264enc means `preset=medium` with lookahead and B-frames - tens
@@ -513,12 +520,22 @@ impl Pipeline {
     /// ready, waiting only once [`max_in_flight`] frames are inside (every access unit comes out, in order, one per call).
     /// Returns it with its frame id.
     fn encode(&mut self, buffer: &[u8], keyframe: bool, frame_id: u64) -> Result<Option<(Vec<u8>, u64)>> {
-        // SAFETY: the event is handed over to appsrc
+        // SAFETY: encoder/source are live GObjects; force-IDR takes no arguments and returns void.
         unsafe {
-            if keyframe {
-                let event = (self.api.force_key_unit)(CLOCK_TIME_NONE, CLOCK_TIME_NONE, CLOCK_TIME_NONE, 1, 0);
-                if (self.api.element_send_event)(self.source, event) == 0 {
-                    log::warn!("GStreamer {}: the keyframe request was not handled", self.element.name);
+            // A new pipeline already starts with an IDR. Requests arriving while
+            // JPEG decode is still starting must not touch the unready encoder.
+            if keyframe && self.has_output {
+                if self.element.name == "nvv4l2h264enc" {
+                    // JetPack's encoder accepts GstForceKeyUnit but can ignore it, leaving a WebRTC
+                    // receiver unable to recover after packet loss until the periodic IDR. Use the
+                    // NVIDIA action that actually requests an IDR from the V4L2 encoder.
+                    let class = *(self.encoder as *const Pointer);
+                    let instance_type = *(class as *const usize);
+                    ensure!((self.api.signal_lookup)(c"force-IDR".as_ptr(), instance_type) != 0, "nvv4l2h264enc has no force-IDR action");
+                    (self.api.signal_emit_by_name)(self.encoder, c"force-IDR".as_ptr());
+                } else {
+                    let event = (self.api.force_key_unit)(CLOCK_TIME_NONE, CLOCK_TIME_NONE, CLOCK_TIME_NONE, 1, 0);
+                    ensure!((self.api.element_send_event)(self.source, event) != 0, "GStreamer {}: the keyframe request was not handled", self.element.name);
                 }
             }
         }
@@ -528,6 +545,7 @@ impl Pipeline {
         let timeout = if self.inside.len() as u64 > in_flight { OUTPUT_TIMEOUT } else { Duration::ZERO };
         let data = pull(self.api, self.sink, timeout)?;
         self.check_bus()?;
+        self.has_output |= data.is_some();
         Ok(data.map(|data| (data, self.inside.pop_front().unwrap_or(frame_id))))
     }
 
@@ -537,6 +555,7 @@ impl Pipeline {
             return Ok(None);
         }
         let data = pull(self.api, self.sink, wait)?;
+        self.has_output |= data.is_some();
         Ok(data.and_then(|data| Some((data, self.inside.pop_front()?))))
     }
 }
@@ -1079,6 +1098,31 @@ mod tests {
     }
 
     use super::*;
+
+    /// Run explicitly on a Jetson. Check the output bitstream, not whether GStreamer accepted the event.
+    #[test]
+    #[ignore = "requires Jetson nvv4l2h264enc and nvjpegdec"]
+    fn jetson_requested_keyframes_recover_raw_and_jpeg_streams() {
+        let api = api().unwrap();
+        let element = HARDWARE.iter().find(|element| element.name == "nvv4l2h264enc").unwrap();
+        assert!(has_element(api, element.name), "this test must run on Jetson hardware");
+        let raw = vec![128; 320 * 240 * 3 / 2];
+        let mut jpeg = Vec::new();
+        let mut jpeg_encoder = jpeg_encoder::Encoder::new(&mut jpeg, 90);
+        jpeg_encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+        jpeg_encoder.encode(&vec![128; 320 * 240 * 3], 320, 240, jpeg_encoder::ColorType::Rgb).unwrap();
+        for (data, jpeg_size) in [(raw.as_slice(), None), (jpeg.as_slice(), Some((320, 240)))] {
+            let mut pipeline = Pipeline::new(api, element, (320, 240), jpeg_size, 1_000_000, 30.0, &("test_src".into(), "test_sink".into())).unwrap();
+            for i in 0..24 {
+                let requested = [6, 13, 20].contains(&i);
+                let output = pipeline.encode(data, requested, i).unwrap()
+                    .or_else(|| pipeline.next(Duration::from_secs(2)).unwrap())
+                    .expect("one encoded frame after pushing and waiting");
+                assert_eq!(output.1, i);
+                assert_eq!(has_idr(&output.0), i == 0 || requested, "JPEG={jpeg_size:?}, frame {i}: a request must produce a recovery IDR");
+            }
+        }
+    }
 
     #[test]
     fn small_pictures_scale_up_to_the_least_size() {
